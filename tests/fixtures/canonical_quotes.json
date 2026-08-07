@@ -1,0 +1,22 @@
+{
+  "quotes": [
+    {
+      "source_id": "ignored",
+      "family": "pinnacle",
+      "sport": "nba",
+      "event_id": "provider-event-1",
+      "participant_a": "Los Angeles Lakers",
+      "participant_b": "Boston Celtics",
+      "participant_a_provider_ids": {"sportradar":"sr:team:1"},
+      "participant_b_provider_ids": {"sportradar":"sr:team:2"},
+      "start_time": "2026-08-07T02:00:00Z",
+      "decimal_odds_a": "1.90",
+      "decimal_odds_b": "2.00",
+      "decimal_odds_neutral": null,
+      "source_timestamp": "2026-08-06T23:59:00Z",
+      "fetched_at": "2026-08-06T23:59:01Z",
+      "parser_version": "fixture-v1",
+      "validation_only": false
+    }
+  ]
+}

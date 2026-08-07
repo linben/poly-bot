@@ -1,0 +1,9 @@
+/target
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.env
+dist/
+artifacts/
+.DS_Store

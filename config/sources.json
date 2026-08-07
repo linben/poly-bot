@@ -1,0 +1,17 @@
+{
+  "sources": [
+    {"id":"pinnacle","display_name":"Pinnacle","family":"pinnacle","tier":"primary","reference":true,"homepage":"https://www.pinnacle.com/en/","endpoint_env":"SOURCE_PINNACLE_URL"},
+    {"id":"circa","display_name":"Circa Sports","family":"circa","tier":"primary","reference":true,"homepage":"https://www.circasports.com/","endpoint_env":"SOURCE_CIRCA_URL"},
+    {"id":"bookmaker","display_name":"Bookmaker.eu","family":"bookmaker","tier":"primary","reference":true,"homepage":"https://www.bookmaker.eu/","endpoint_env":"SOURCE_BOOKMAKER_URL"},
+    {"id":"betonline","display_name":"BetOnline","family":"bet_online","tier":"primary","reference":true,"homepage":"https://www.betonline.ag/","endpoint_env":"SOURCE_BETONLINE_URL"},
+    {"id":"bet365","display_name":"bet365","family":"bet365","tier":"primary","reference":false,"homepage":"https://www.bet365.com/","endpoint_env":"SOURCE_BET365_URL"},
+    {"id":"draftkings","display_name":"DraftKings","family":"draft_kings","tier":"primary","reference":false,"homepage":"https://sportsbook.draftkings.com/","endpoint_env":"SOURCE_DRAFTKINGS_URL"},
+    {"id":"fanduel","display_name":"FanDuel","family":"fan_duel","tier":"primary","reference":false,"homepage":"https://sportsbook.fanduel.com/","endpoint_env":"SOURCE_FANDUEL_URL"},
+    {"id":"caesars","display_name":"Caesars","family":"caesars","tier":"primary","reference":false,"homepage":"https://www.caesars.com/sportsbook-and-casino","endpoint_env":"SOURCE_CAESARS_URL"},
+    {"id":"betmgm","display_name":"BetMGM","family":"bet_mgm","tier":"primary","reference":false,"homepage":"https://sports.betmgm.com/","endpoint_env":"SOURCE_BETMGM_URL"},
+    {"id":"fanatics","display_name":"Fanatics","family":"fanatics","tier":"primary","reference":false,"homepage":"https://sportsbook.fanatics.com/","endpoint_env":"SOURCE_FANATICS_URL"},
+    {"id":"betrivers","display_name":"BetRivers","family":"kambi","tier":"fallback","reference":false,"homepage":"https://www.betrivers.com/","endpoint_env":"SOURCE_BETRIVERS_URL"},
+    {"id":"hardrock","display_name":"Hard Rock Bet","family":"hard_rock","tier":"fallback","reference":false,"homepage":"https://www.hardrock.bet/","endpoint_env":"SOURCE_HARDROCK_URL"},
+    {"id":"thescore","display_name":"theScore Bet","family":"penn","tier":"fallback","reference":false,"homepage":"https://thescore.bet/","endpoint_env":"SOURCE_THESCORE_URL"}
+  ]
+}

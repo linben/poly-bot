@@ -1,0 +1,75 @@
+{
+  "events": [
+    {
+      "id": "event-1",
+      "startTime": "2099-08-07T02:00:00Z",
+      "active": true,
+      "closed": false,
+      "live": false,
+      "ended": false,
+      "gameId": 123,
+      "sportradarGameId": "sr:match:123",
+      "markets": [
+        {
+          "id": "market-moneyline",
+          "slug": "los-angeles-sparks-at-new-york-liberty",
+          "description": "Resolves to the full-game winner.",
+          "sportsMarketType": "basketball_team_full_game_winner",
+          "active": true,
+          "closed": false,
+          "hidden": false,
+          "ep3Status": "OPEN",
+          "ep3SyncedAt": "2099-08-06T12:00:00Z",
+          "marketSides": [
+            {
+              "id": "side-a",
+              "description": "Los Angeles Sparks",
+              "long": true,
+              "teamId": 1,
+              "team": {
+                "name": "Los Angeles Sparks",
+                "providerIds": [{"provider":"sportradar","providerId":"sr:team:1"}]
+              }
+            },
+            {
+              "id": "side-b",
+              "description": "New York Liberty",
+              "long": false,
+              "teamId": 2,
+              "team": {
+                "name": "New York Liberty",
+                "providerIds": [{"provider":"sportradar","providerId":"sr:team:2"}]
+              }
+            }
+          ],
+          "orderPriceMinTickSize": "0.01",
+          "minimumTradeQty": "1",
+          "feeCoefficient": "0.06"
+        },
+        {
+          "id": "market-spread",
+          "slug": "los-angeles-sparks-plus-five",
+          "description": "Resolves against the spread.",
+          "sportsMarketType": "basketball_team_full_game_spread",
+          "active": true,
+          "closed": false,
+          "hidden": false,
+          "ep3Status": "OPEN",
+          "marketSides": [],
+          "orderPriceMinTickSize": "0.01",
+          "minimumTradeQty": "1",
+          "feeCoefficient": "0.06"
+        }
+      ]
+    },
+    {
+      "id": "event-live",
+      "startTime": "2099-08-07T03:00:00Z",
+      "active": true,
+      "closed": false,
+      "live": true,
+      "ended": false,
+      "markets": []
+    }
+  ]
+}

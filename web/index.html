@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Polymarket Sports Research</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      font-size: 14px;
+      --bg: #f5f6f7; --surface: #fff; --ink: #18201d; --muted: #65706b;
+      --line: #dce1de; --green: #116149; --amber: #98621a; --red: #a43d3d;
+    }
+    * { box-sizing: border-box; letter-spacing: 0; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    header {
+      height: 58px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 24px; background: #17211d; color: white; border-bottom: 3px solid #2e8b69;
+    }
+    h1 { margin: 0; font-size: 17px; font-weight: 650; }
+    .header-actions { display: flex; align-items: center; gap: 12px; }
+    header span { color: #b9c5c0; font-size: 12px; }
+    header button {
+      min-height: 30px; border-color: #52625b; background: transparent; color: white;
+    }
+    main { max-width: 1440px; margin: 0 auto; padding: 20px 24px 40px; }
+    .toolbar {
+      display: flex; gap: 12px; align-items: center; justify-content: space-between;
+      margin-bottom: 14px; min-height: 38px;
+    }
+    .filters { display: flex; gap: 6px; flex-wrap: wrap; }
+    button {
+      border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+      border-radius: 5px; min-height: 34px; padding: 0 11px; cursor: pointer;
+    }
+    button[aria-pressed="true"] { background: #e3f0ea; border-color: #78a994; color: #0c533d; }
+    .status { color: var(--muted); font-size: 12px; }
+    .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); }
+    table { border-collapse: collapse; width: 100%; min-width: 1080px; }
+    th {
+      text-align: left; color: #4f5c56; font-size: 11px; text-transform: uppercase;
+      padding: 10px 12px; border-bottom: 1px solid var(--line); background: #fafbfa;
+    }
+    td { padding: 11px 12px; border-bottom: 1px solid #edf0ee; vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+    .num { font-variant-numeric: tabular-nums; text-align: right; }
+    .primary { font-weight: 620; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .tag {
+      display: inline-block; border-radius: 4px; padding: 3px 6px; font-size: 11px;
+      font-weight: 650; text-transform: uppercase;
+    }
+    .actionable { background: #dcefe6; color: var(--green); }
+    .watchlist { background: #f5ead6; color: var(--amber); }
+    .rejected { background: #f3dfdf; color: var(--red); }
+    .unchanged { background: #dcefe6; color: var(--green); }
+    .lower, .review { background: #f5ead6; color: var(--amber); }
+    .reject { background: #f3dfdf; color: var(--red); }
+    .positive { color: var(--green); font-weight: 650; }
+    .news { max-width: 330px; min-width: 220px; }
+    .empty { padding: 52px 20px; text-align: center; color: var(--muted); }
+    @media (max-width: 640px) {
+      header { min-height: 58px; height: auto; padding: 10px 14px; gap: 10px; }
+      h1 { font-size: 15px; }
+      header span { display: none; }
+      main { padding: 14px; }
+      .toolbar { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Polymarket Sports Research</h1>
+    <div class="header-actions">
+      <span>Paper bankroll $100 &middot; Max exposure $5</span>
+      <button id="auth" hidden>Sign in</button>
+    </div>
+  </header>
+  <main>
+    <div class="toolbar">
+      <div class="filters" role="group" aria-label="Recommendation filter">
+        <button data-filter="actionable" aria-pressed="true">Actionable</button>
+        <button data-filter="watchlist" aria-pressed="true">Watchlist</button>
+        <button data-filter="rejected" aria-pressed="false">Rejected</button>
+      </div>
+      <div class="status" id="status">Loading latest scan...</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Class</th><th>Event / Side</th><th>Sport</th>
+          <th class="num">Fair</th><th class="num">Price</th><th class="num">Net edge</th>
+          <th class="num">Risk</th><th class="num">Qty</th><th>Sources</th><th>News</th>
+          <th>Book time</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden>No recommendations match the selected filters.</div>
+    </div>
+  </main>
+  <script>window.POLYBOT_CONFIG = window.POLYBOT_CONFIG || {};</script>
+  <script src="/config.js"></script>
+  <script>
+    const state = { items: [], filters: new Set(["actionable", "watchlist"]) };
+    const config = window.POLYBOT_CONFIG || {};
+    const authButton = document.querySelector("#auth");
+    if (config.authorizeUrl) {
+      authButton.hidden = false;
+      authButton.textContent = sessionStorage.getItem("access_token") ? "Sign out" : "Sign in";
+      authButton.addEventListener("click", async () => {
+        if (sessionStorage.getItem("access_token")) {
+          sessionStorage.removeItem("access_token");
+          location.assign(config.logoutUrl);
+        } else {
+          const bytes = crypto.getRandomValues(new Uint8Array(48));
+          const verifier = btoa(String.fromCharCode(...bytes))
+            .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+          const challenge = btoa(String.fromCharCode(...new Uint8Array(digest)))
+            .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+          sessionStorage.setItem("pkce_verifier", verifier);
+          const url = new URL(config.authorizeUrl);
+          url.search = new URLSearchParams({
+            client_id: config.clientId,
+            response_type: "code",
+            redirect_uri: config.redirectUri,
+            scope: "openid email",
+            code_challenge_method: "S256",
+            code_challenge: challenge
+          });
+          location.assign(url);
+        }
+      });
+    }
+    const pct = value => `${(Number(value) * 100).toFixed(1)}%`;
+    const usd = value => `$${Number(value).toFixed(2)}`;
+    const safe = value => String(value ?? "").replace(/[&<>"']/g, c => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+    function render() {
+      const visible = state.items.filter(item => state.filters.has(item.effective_class));
+      document.querySelector("#rows").innerHTML = visible.map(item => `
+        <tr>
+          <td><span class="tag ${safe(item.effective_class)}">${safe(item.effective_class)}</span></td>
+          <td><div class="primary">${safe(item.participant)}</div>
+              <div class="sub">${safe(item.market_slug)} &middot; ${safe(item.side)}</div></td>
+          <td>${safe(item.sport).toUpperCase()}</td>
+          <td class="num">${pct(item.conservative_probability)}</td>
+          <td class="num">${usd(item.executable_price)}</td>
+          <td class="num positive">${pct(item.net_edge)}</td>
+          <td class="num">${usd(item.maximum_loss)}</td>
+          <td class="num">${safe(item.quantity)}</td>
+          <td>${item.family_count} families<div class="sub">${safe(item.source_ids.join(", "))}</div></td>
+          <td class="news">${item.news
+            ? `<span class="tag ${safe(item.news.confidence_effect)}">${safe(item.news.confidence_effect)}</span>
+               <div class="sub">${safe(item.news.summary)}</div>`
+            : `<span class="sub">Pending</span>`}</td>
+          <td>${new Date(item.book_time).toLocaleTimeString()}</td>
+        </tr>`).join("");
+      document.querySelector("#empty").hidden = visible.length !== 0;
+    }
+    document.querySelectorAll("[data-filter]").forEach(button => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.filter;
+        state.filters.has(key) ? state.filters.delete(key) : state.filters.add(key);
+        button.setAttribute("aria-pressed", state.filters.has(key));
+        render();
+      });
+    });
+    async function accessToken() {
+      const query = new URLSearchParams(location.search);
+      const code = query.get("code");
+      if (!code) return sessionStorage.getItem("access_token");
+      const verifier = sessionStorage.getItem("pkce_verifier");
+      if (!verifier) throw new Error("Missing sign-in verifier");
+      const response = await fetch(config.tokenUrl, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: config.clientId,
+          code,
+          redirect_uri: config.redirectUri,
+          code_verifier: verifier
+        })
+      });
+      if (!response.ok) throw new Error(`Sign-in HTTP ${response.status}`);
+      const payload = await response.json();
+      sessionStorage.setItem("access_token", payload.access_token);
+      sessionStorage.removeItem("pkce_verifier");
+      history.replaceState(null, "", location.pathname);
+      return payload.access_token;
+    }
+    accessToken().then(token => {
+      if (!token && config.authorizeUrl) {
+        document.querySelector("#status").textContent = "Sign in required";
+        return null;
+      }
+      const headers = { accept: "application/json" };
+      if (token) headers.authorization = `Bearer ${token}`;
+      return fetch("/api/opportunities", { headers }).then(response => {
+        if (response.status === 401 && config.authorizeUrl) {
+          sessionStorage.removeItem("access_token");
+          throw new Error("Session expired");
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      });
+    })
+      .then(items => {
+        if (items === null) return;
+        state.items = items;
+        document.querySelector("#status").textContent =
+          `${items.length} records | refreshed ${new Date().toLocaleTimeString()}`;
+        render();
+      })
+      .catch(error => {
+        document.querySelector("#status").textContent = `Unable to load: ${error.message}`;
+        render();
+      });
+  </script>
+</body>
+</html>
