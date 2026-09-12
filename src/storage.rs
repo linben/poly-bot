@@ -139,8 +139,9 @@ async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option
 
 /// `latest-*.json` are caches of the most recent scan that the next scan
 /// rewrites in full. One written by an older binary (schema change) must not
-/// wedge a viewer or the scan loop: log it and treat it as absent. IO errors
-/// still propagate.
+/// wedge a viewer or the scan loop, and the UI polls every 2 s, so it is moved
+/// aside to `<name>.stale` once (nothing is destroyed) and then reads as
+/// absent. IO errors still propagate.
 async fn read_cache<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let Some(content) = read_bytes(path).await? else {
         return Ok(None);
@@ -148,7 +149,13 @@ async fn read_cache<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Optio
     match decode(path, &content) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
-            tracing::warn!(%error, "ignoring stale cache until the next scan");
+            let aside = path.with_extension("json.stale");
+            match tokio::fs::rename(path, &aside).await {
+                Ok(()) => {
+                    tracing::warn!(%error, aside = %aside.display(), "moved stale cache aside")
+                }
+                Err(rename_error) => tracing::warn!(%error, %rename_error, "ignoring stale cache"),
+            }
             Ok(None)
         }
     }
@@ -727,10 +734,11 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A `latest-*.json` written by an older binary must not wedge a viewer;
-    /// `portfolio.json` is state and must fail loudly, naming the file.
+    /// A `latest-*.json` written by an older binary must not wedge a viewer:
+    /// it is moved aside once and then reads as absent. `portfolio.json` is
+    /// state and must fail loudly, naming the file.
     #[tokio::test]
-    async fn stale_caches_are_ignored_but_state_files_are_strict() {
+    async fn stale_caches_are_moved_aside_but_state_files_are_strict() {
         let root = std::env::temp_dir().join(format!("polybot-storage-test-{}", Uuid::new_v4()));
         let store = LocalStore::new(&root).unwrap();
         fs::write(root.join("latest-opportunities.json"), br#"[{"id":"x"}]"#).unwrap();
@@ -739,6 +747,12 @@ mod tests {
 
         assert!(store.latest_opportunities().await.unwrap().is_empty());
         assert!(store.latest_scan().await.unwrap().is_none());
+        assert!(!root.join("latest-opportunities.json").exists());
+        assert_eq!(
+            fs::read(root.join("latest-opportunities.json.stale")).unwrap(),
+            br#"[{"id":"x"}]"#
+        );
+        assert!(root.join("latest-scan.json.stale").exists());
         let error = store
             .load_portfolio(Decimal::ONE_HUNDRED)
             .await
