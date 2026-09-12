@@ -20,10 +20,10 @@ architecture and technology choices are documented in
 - Markets: structured pregame full-game/match moneylines only
 - Contract acquisition price: `$0.35` through `$0.65`
 - Paper bankroll: `$100`
-- Position risk: quarter Kelly, bounded to 1-5% of bankroll
-- Watchlist: at least three independent source families
+- Position risk: quarter Kelly, bounded to 1-5% of bankroll (floor configurable)
+- Watchlist: at least three independent source families (configurable, >= 2)
 - Actionable consensus: at least five independent families, including a
-  reference book
+  reference book (both configurable)
 - Edge: at least five percentage points raw and three percentage points after
   dispersion and fees
 - Confirmation: when any candidate survives the continuous pass, refetch up to
@@ -64,10 +64,23 @@ the same scanner, consensus, sizing, and news logic.
 cp .env.example .env            # optional: add THE_ODDS_API_KEY / BRAVE_SEARCH_API_KEY
 set -a; source .env; set +a
 make local                      # or: cargo run --release --bin local
+make local-explore              # loosest gates, separate data-explore/ dir
 make local-once                 # one scan + one news pass, then exit
 make local-headless             # loops only, no terminal UI
 make tui                        # attach a viewer to data/ (or RUN_MODE=cloud)
 ```
+
+Every gate is an environment variable (see `.env.example`): `MINIMUM_RAW_EDGE`,
+`MINIMUM_NET_EDGE`, `MINIMUM_PRICE`/`MAXIMUM_PRICE`,
+`WATCHLIST_SOURCE_FAMILIES` (>= 2), `MINIMUM_SOURCE_FAMILIES` (>= watchlist),
+`REQUIRE_REFERENCE_BOOK`, `MINIMUM_POSITION_FRACTION` (0 disables the size
+floor). The System view shows the values in force. `make local-explore` runs the
+loosest combination validation permits into `data-explore/`, so a quiet market
+still classifies rows; paper positions opened there are not comparable with the
+default policy. Under any policy the Overview table is never empty once a scan
+has run: with no live candidate it ranks every side by how close it is to the
+gates, and the `gap to gates` column names what each still needs (`edge
++4.3pp`, `fam +2`, `price`).
 
 `local` runs a fixed-cadence scan (`SCAN_INTERVAL_SECONDS`, default 300),
 drains the news queue every 20 s, prunes scan snapshots older than
@@ -100,7 +113,7 @@ credentials. There is no hosted web UI.
 
 | View | Shows | Keys |
 | --- | --- | --- |
-| Overview | status line (mode, phase, scan age and duration, counts, next scan); SCAN, SOURCES, EDGE & PAPER panels; CANDIDATES (live candidates first, then closest misses); LOG tail | `o` paper-open the top candidate, `r` rescan now (in-process) or reload (attached) |
+| Overview | status line (mode, phase, scan age and duration, counts, next scan); SCAN, SOURCES, EDGE & PAPER panels; CANDIDATES (live candidates first, then the rows nearest the gates: fewest failed gate categories, then largest net edge); LOG tail | `o` paper-open the top candidate, `r` rescan now (in-process) or reload (attached) |
 | Markets | every evaluated market side, with a DETAIL pane for the selected row (VWAP, maker price, size, fee, sources, news, every rejection reason) | `↑`/`↓` `j`/`k` `PgUp`/`PgDn` `g`/`G`, `s` sort (net edge / raw edge / families / class / sport), `f` cycle sport filter, `⏎` toggle detail, `o` paper-open selected |
 | Sources | reachability, quotes, latency per source; markets matched per source and sport | `r` rescan |
 | Portfolio | bankroll, exposure gauge, headroom; open paper positions with their current class | `↑`/`↓`, `c` close selected |

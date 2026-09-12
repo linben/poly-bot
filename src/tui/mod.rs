@@ -167,21 +167,24 @@ impl App {
         rows
     }
 
-    /// Candidates first, then the closest misses, for the Overview table.
+    /// Candidates first, then the rows nearest the gates: fewest failed gate
+    /// categories (price band, family quorum, edge), then the largest net
+    /// edge. This is the Overview table; it is never empty while a scan has
+    /// rows, so a quiet market still shows where the closest calls are.
     pub fn candidate_rows(&self) -> Vec<&ResearchOpportunity> {
-        let mut rows = self.store.rows.iter().collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
+        let mut rows = self
+            .store
+            .rows
+            .iter()
+            .map(|row| (row, data::GateGap::of(row, &self.settings)))
+            .collect::<Vec<_>>();
+        rows.sort_by(|(left, left_gap), (right, right_gap)| {
             class_rank(left.effective_class)
                 .cmp(&class_rank(right.effective_class))
-                .then(
-                    right
-                        .opportunity
-                        .family_count
-                        .cmp(&left.opportunity.family_count),
-                )
-                .then(right.opportunity.raw_edge.cmp(&left.opportunity.raw_edge))
+                .then(left_gap.failures().cmp(&right_gap.failures()))
+                .then(right.opportunity.net_edge.cmp(&left.opportunity.net_edge))
         });
-        rows
+        rows.into_iter().map(|(row, _)| row).collect()
     }
 
     pub fn selected_market(&self) -> Option<&ResearchOpportunity> {

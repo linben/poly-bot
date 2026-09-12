@@ -41,6 +41,59 @@ pub struct EdgeStats {
     pub best_net_edge: Option<f64>,
 }
 
+/// What a side still needs to clear the gates in force: the three
+/// independent categories the operator can act on (price band, family
+/// quorum, edge). Size floors follow from edge and are not counted twice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateGap {
+    /// Executable price outside the configured band.
+    pub price: bool,
+    /// Families short of the watchlist quorum.
+    pub families: usize,
+    /// Percentage points short of the binding edge gate (raw or net).
+    pub edge_pp: f64,
+}
+
+impl GateGap {
+    pub fn of(row: &ResearchOpportunity, settings: &Settings) -> Self {
+        let o = &row.opportunity;
+        let raw_short = decimal_f64(settings.minimum_raw_edge - o.raw_edge);
+        let net_short = decimal_f64(settings.minimum_net_edge - o.net_edge);
+        Self {
+            price: o.executable_price < settings.minimum_price
+                || o.executable_price > settings.maximum_price,
+            families: settings
+                .watchlist_source_families
+                .saturating_sub(o.family_count),
+            edge_pp: raw_short.max(net_short).max(0.0) * 100.0,
+        }
+    }
+
+    /// Number of failed categories; 0 for a row inside every gate.
+    pub fn failures(&self) -> u8 {
+        u8::from(self.price) + u8::from(self.families > 0) + u8::from(self.edge_pp > 0.0)
+    }
+
+    /// `edge +4.3pp · fam +2 · price`, or `-` when nothing is missing.
+    pub fn label(&self) -> String {
+        let mut parts = Vec::with_capacity(3);
+        if self.edge_pp > 0.0 {
+            parts.push(format!("edge +{:.1}pp", self.edge_pp));
+        }
+        if self.families > 0 {
+            parts.push(format!("fam +{}", self.families));
+        }
+        if self.price {
+            parts.push("price".to_string());
+        }
+        if parts.is_empty() {
+            "-".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
 impl EdgeStats {
     pub fn from_rows(rows: &[ResearchOpportunity]) -> Self {
         let mut stats = Self {

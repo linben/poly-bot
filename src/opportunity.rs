@@ -129,8 +129,12 @@ impl OpportunityEngine {
             self.settings.kelly_fraction,
         )
         .min(self.settings.maximum_position_fraction);
-        if kelly < Decimal::new(1, 2) {
-            reasons.push("quarter-Kelly size is below one percent".into());
+        if kelly < self.settings.minimum_position_fraction {
+            reasons.push(format!(
+                "quarter-Kelly size {} is below {}",
+                kelly.round_dp(4),
+                self.settings.minimum_position_fraction
+            ));
         }
         let event_exposure = portfolio.exposure_for_event(&market.event_id);
         let portfolio_remaining =
@@ -149,8 +153,11 @@ impl OpportunityEngine {
         if sized.quantity < market.minimum_quantity {
             reasons.push("insufficient eligible book depth".into());
         }
-        if sized.maximum_loss < self.settings.bankroll * Decimal::new(1, 2) {
-            reasons.push("depth-limited maximum loss is below one percent".into());
+        if sized.maximum_loss < self.settings.bankroll * self.settings.minimum_position_fraction {
+            reasons.push(format!(
+                "depth-limited maximum loss is below {} of bankroll",
+                self.settings.minimum_position_fraction
+            ));
         }
         let executable = if sized.quantity > Decimal::ZERO {
             sized.average_side_price
@@ -187,11 +194,10 @@ impl OpportunityEngine {
         }
 
         let hard_rejection = !reasons.is_empty();
+        let reference_ok = consensus.has_reference || !self.settings.require_reference_book;
         let class = if hard_rejection {
             RecommendationClass::Rejected
-        } else if consensus.family_count >= self.settings.minimum_source_families
-            && consensus.has_reference
-        {
+        } else if consensus.family_count >= self.settings.minimum_source_families && reference_ok {
             RecommendationClass::Actionable
         } else {
             RecommendationClass::Watchlist
@@ -203,7 +209,7 @@ impl OpportunityEngine {
                     self.settings.minimum_source_families
                 ));
             }
-            if !consensus.has_reference {
+            if !reference_ok {
                 reasons.push("requires a reference sportsbook".into());
             }
         }
@@ -348,6 +354,56 @@ mod tests {
         assert_eq!(short.executable_price, Decimal::new(45, 2));
         assert_eq!(short.maker_price, Some(Decimal::new(44, 2)));
         assert_eq!(short.class, RecommendationClass::Actionable);
+    }
+
+    #[test]
+    fn reference_book_requirement_is_a_setting() {
+        let mut consensus = consensus();
+        consensus.has_reference = false;
+        let short = |settings: Settings| {
+            OpportunityEngine::new(settings)
+                .evaluate(&market(), &book(), &consensus, &portfolio())
+                .into_iter()
+                .find(|item| item.side == OutcomeSide::Short)
+                .unwrap()
+        };
+        let strict = short(Settings::default());
+        assert_eq!(strict.class, RecommendationClass::Watchlist);
+        assert!(strict.reasons.iter().any(|r| r.contains("reference")));
+        let relaxed = short(Settings {
+            require_reference_book: false,
+            ..Settings::default()
+        });
+        assert_eq!(relaxed.class, RecommendationClass::Actionable);
+    }
+
+    #[test]
+    fn position_floor_zero_admits_tiny_edges() {
+        // Short side: fair 0.47 vs 0.45 executable is a 2 pp edge, which
+        // quarter-Kelly sizes below the default one-percent floor.
+        let mut consensus = consensus();
+        consensus.probability_a = Decimal::new(53, 2);
+        consensus.probability_b = Decimal::new(47, 2);
+        let short = |settings: Settings| {
+            OpportunityEngine::new(settings)
+                .evaluate(&market(), &book(), &consensus, &portfolio())
+                .into_iter()
+                .find(|item| item.side == OutcomeSide::Short)
+                .unwrap()
+        };
+        let relaxed_edges = Settings {
+            minimum_raw_edge: Decimal::ZERO,
+            minimum_net_edge: Decimal::ZERO,
+            ..Settings::default()
+        };
+        let floored = short(relaxed_edges.clone());
+        assert_eq!(floored.class, RecommendationClass::Rejected);
+        assert!(floored.reasons.iter().any(|r| r.contains("Kelly")));
+        let unfloored = short(Settings {
+            minimum_position_fraction: Decimal::ZERO,
+            ..relaxed_edges
+        });
+        assert_ne!(unfloored.class, RecommendationClass::Rejected);
     }
 
     #[test]

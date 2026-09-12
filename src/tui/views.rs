@@ -10,7 +10,10 @@ use ratatui::{
 use super::{App, View, widgets::*};
 use crate::{
     domain::{RecommendationClass, ResearchOpportunity, Sport},
-    tui::{data::decimal_f64, feed::Phase},
+    tui::{
+        data::{GateGap, decimal_f64},
+        feed::Phase,
+    },
 };
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
@@ -384,9 +387,14 @@ fn render_candidates(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Tone::Good.style(),
         )]
     } else {
-        vec![muted(
-            "none live; showing closest misses by families then raw edge",
-        )]
+        vec![muted(format!(
+            "none live · nearest the gates first (raw ≥ {}, net ≥ {}, {}+ families, price {}–{}) · gap = what each row still needs",
+            app.settings.minimum_raw_edge,
+            app.settings.minimum_net_edge,
+            app.settings.watchlist_source_families,
+            app.settings.minimum_price,
+            app.settings.maximum_price,
+        ))]
     };
     let inner = section(frame, area, "CANDIDATES", detail);
     render_market_table(frame, inner, app, &rows, None);
@@ -434,7 +442,7 @@ fn render_markets(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_market_table(
     frame: &mut Frame<'_>,
     area: Rect,
-    _app: &App,
+    app: &App,
     rows: &[&ResearchOpportunity],
     cursor: Option<usize>,
 ) {
@@ -478,6 +486,12 @@ fn render_market_table(
                 });
             let raw = decimal_f64(o.raw_edge);
             let net = decimal_f64(o.net_edge);
+            let gap = GateGap::of(row, &app.settings);
+            let gap_cell = if gap.failures() == 0 {
+                muted("-")
+            } else {
+                Span::styled(gap.label(), Tone::Warn.style())
+            };
             let mut table_row = Row::new(vec![
                 Cell::from(badge(class_label(class), Tone::for_class(class))),
                 Cell::from(sport_label(o.sport)),
@@ -489,6 +503,7 @@ fn render_market_table(
                 Cell::from(Line::from(signed_pp(raw)).alignment(Alignment::Right)),
                 Cell::from(Line::from(signed_pp(net)).alignment(Alignment::Right)),
                 Cell::from(right(o.family_count.to_string())),
+                Cell::from(gap_cell),
                 Cell::from(muted(fit(&o.source_ids.join(","), 34))),
                 Cell::from(news),
             ]);
@@ -510,6 +525,7 @@ fn render_market_table(
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(3),
+            Constraint::Length(26),
             Constraint::Min(12),
             Constraint::Length(9),
         ],
@@ -526,6 +542,7 @@ fn render_market_table(
             "raw",
             "net",
             "fam",
+            "gap to gates",
             "sources",
             "news",
         ])
@@ -820,15 +837,22 @@ fn render_system(frame: &mut Frame<'_>, area: Rect, app: &App) {
             sep(),
             label("quorum"),
             plain(format!(
-                "{} families watchlist · {} + reference actionable",
-                s.watchlist_source_families, s.minimum_source_families
+                "{} families watchlist · {}{} actionable",
+                s.watchlist_source_families,
+                s.minimum_source_families,
+                if s.require_reference_book {
+                    " + reference"
+                } else {
+                    ""
+                }
             )),
         ]),
         Line::from(vec![
             label("risk"),
             plain(format!(
-                "bankroll {} · position 1–{}% · exposure cap {} · Kelly ×{}",
+                "bankroll {} · position {}–{}% · exposure cap {} · Kelly ×{}",
                 s.bankroll,
+                decimal_f64(s.minimum_position_fraction) * 100.0,
                 decimal_f64(s.maximum_position_fraction) * 100.0,
                 s.maximum_total_exposure,
                 s.kelly_fraction

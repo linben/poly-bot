@@ -1,4 +1,4 @@
-.PHONY: check test local local-headless local-once run probe paper tui terraform-init terraform-check lambda
+.PHONY: check test local local-explore local-headless local-once run probe paper tui terraform-init terraform-check lambda
 
 check:
 	cargo fmt --check
@@ -17,6 +17,15 @@ local-headless:
 
 local-once:
 	cargo run --release --bin local -- --once
+
+# Exploration profile: the loosest gates validation permits, so a quiet market
+# still classifies rows. Paper positions opened under it are not comparable
+# with the default policy; use a separate data dir.
+local-explore:
+	MINIMUM_RAW_EDGE=0.01 MINIMUM_NET_EDGE=0 MINIMUM_POSITION_FRACTION=0 \
+	MINIMUM_PRICE=0.10 MAXIMUM_PRICE=0.90 WATCHLIST_SOURCE_FAMILIES=2 \
+	MINIMUM_SOURCE_FAMILIES=3 REQUIRE_REFERENCE_BOOK=false \
+	cargo run --release --bin local -- --data-dir data-explore
 
 # Cloud one-shot scan (what the ECS task runs).
 run:
