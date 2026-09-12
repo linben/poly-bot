@@ -1,5 +1,5 @@
 [Unit]
-Description=Polybot local mode (scanner, news review, dashboard)
+Description=Polybot local mode (scanner, news review; headless)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/poly-bot
 EnvironmentFile=%h/poly-bot/.env
-ExecStart=%h/poly-bot/target/release/local --data-dir %h/poly-bot/data
+ExecStart=%h/poly-bot/target/release/local --headless --data-dir %h/poly-bot/data
 Restart=on-failure
 RestartSec=10
 

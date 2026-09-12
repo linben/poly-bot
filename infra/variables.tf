@@ -13,12 +13,6 @@ variable "scanner_image_tag" {
   type        = string
 }
 
-variable "api_lambda_zip" {
-  description = "Path to the cargo-lambda API zip."
-  type        = string
-  default     = "../target/lambda/api/bootstrap.zip"
-}
-
 variable "news_lambda_zip" {
   description = "Path to the cargo-lambda news-worker zip."
   type        = string
@@ -51,9 +45,4 @@ variable "enable_the_odds_api" {
   description = "Query The Odds API as the confirmation tier; requires the_odds_api_key in the application secret."
   type        = bool
   default     = false
-}
-
-variable "cognito_domain_prefix" {
-  type    = string
-  default = "polybot-research"
 }

@@ -94,6 +94,13 @@ impl Scanner {
         &self.settings
     }
 
+    pub fn source_ids(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(|source| source.id().to_string())
+            .collect()
+    }
+
     pub async fn run_once(&self) -> Result<ScanSnapshot> {
         let scan_id = Uuid::new_v4();
         if !self

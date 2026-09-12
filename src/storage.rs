@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
-    domain::{NewsEvidence, Opportunity, PaperPortfolio, ScanSnapshot, SourceQuote},
+    domain::{NewsEvidence, Opportunity, PaperPortfolio, ScanSnapshot, ScanSummary, SourceQuote},
 };
 
 #[async_trait]
@@ -25,6 +25,8 @@ pub trait Store: Send + Sync {
     async fn save_portfolio(&self, portfolio: &PaperPortfolio) -> Result<()>;
     async fn save_scan(&self, snapshot: &ScanSnapshot, quotes: &[SourceQuote]) -> Result<()>;
     async fn latest_opportunities(&self) -> Result<Vec<Opportunity>>;
+    /// Timing and source health of the most recent scan, without its rows.
+    async fn latest_scan(&self) -> Result<Option<ScanSummary>>;
     async fn news_for(&self, opportunity_id: Uuid) -> Result<Option<NewsEvidence>>;
     async fn enqueue_news(&self, opportunities: &[Opportunity]) -> Result<()>;
     async fn save_news(&self, evidence: &NewsEvidence) -> Result<()>;
@@ -199,6 +201,7 @@ impl Store for LocalStore {
             &self.root.join("latest-opportunities.json"),
             &snapshot.opportunities,
         )?;
+        self.write_json(&self.root.join("latest-scan.json"), &snapshot.summary())?;
         // Rejected rows live in the per-scan snapshot; the running history
         // only keeps candidates so it stays small enough to grep.
         for opportunity in snapshot
@@ -211,6 +214,15 @@ impl Store for LocalStore {
         Ok(())
     }
 
+    async fn latest_scan(&self) -> Result<Option<ScanSummary>> {
+        let path = self.root.join("latest-scan.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read(&path)
+            .map_err(|error| Error::Storage(format!("read {}: {error}", path.display())))?;
+        Ok(Some(serde_json::from_slice(&content)?))
+    }
     async fn latest_opportunities(&self) -> Result<Vec<Opportunity>> {
         let path = self.root.join("latest-opportunities.json");
         if !path.exists() {
@@ -357,6 +369,42 @@ pub mod aws {
                 .map_err(|error| Error::Storage(error.to_string()))?;
             Ok(())
         }
+
+        async fn put_latest(&self, sort_key: &str, value: &impl serde::Serialize) -> Result<()> {
+            self.dynamodb
+                .put_item()
+                .table_name(&self.table)
+                .item("pk", AttributeValue::S("LATEST".into()))
+                .item("sk", AttributeValue::S(sort_key.into()))
+                .item("record", AttributeValue::S(serde_json::to_string(value)?))
+                .send()
+                .await
+                .map_err(|error| Error::Storage(error.to_string()))?;
+            Ok(())
+        }
+
+        async fn get_latest<T: serde::de::DeserializeOwned>(
+            &self,
+            sort_key: &str,
+        ) -> Result<Option<T>> {
+            let output = self
+                .dynamodb
+                .get_item()
+                .table_name(&self.table)
+                .key("pk", AttributeValue::S("LATEST".into()))
+                .key("sk", AttributeValue::S(sort_key.into()))
+                .send()
+                .await
+                .map_err(|error| Error::Storage(error.to_string()))?;
+            let Some(item) = output.item else {
+                return Ok(None);
+            };
+            let record = item
+                .get("record")
+                .and_then(|value| value.as_s().ok())
+                .ok_or_else(|| Error::Storage(format!("latest {sort_key} record is malformed")))?;
+            Ok(Some(serde_json::from_str(record)?))
+        }
     }
 
     #[async_trait]
@@ -482,39 +530,20 @@ pub mod aws {
                     .await
                     .map_err(|error| Error::Storage(error.to_string()))?;
             }
-            self.dynamodb
-                .put_item()
-                .table_name(&self.table)
-                .item("pk", AttributeValue::S("LATEST".into()))
-                .item("sk", AttributeValue::S("OPPORTUNITIES".into()))
-                .item(
-                    "record",
-                    AttributeValue::S(serde_json::to_string(&snapshot.opportunities)?),
-                )
-                .send()
-                .await
-                .map_err(|error| Error::Storage(error.to_string()))?;
-            Ok(())
+            self.put_latest("OPPORTUNITIES", &snapshot.opportunities)
+                .await?;
+            self.put_latest("SCAN", &snapshot.summary()).await
         }
 
         async fn latest_opportunities(&self) -> Result<Vec<Opportunity>> {
-            let output = self
-                .dynamodb
-                .get_item()
-                .table_name(&self.table)
-                .key("pk", AttributeValue::S("LATEST".into()))
-                .key("sk", AttributeValue::S("OPPORTUNITIES".into()))
-                .send()
-                .await
-                .map_err(|error| Error::Storage(error.to_string()))?;
-            let Some(item) = output.item else {
-                return Ok(Vec::new());
-            };
-            let record = item
-                .get("record")
-                .and_then(|value| value.as_s().ok())
-                .ok_or_else(|| Error::Storage("latest record is malformed".into()))?;
-            Ok(serde_json::from_str(record)?)
+            Ok(self
+                .get_latest::<Vec<Opportunity>>("OPPORTUNITIES")
+                .await?
+                .unwrap_or_default())
+        }
+
+        async fn latest_scan(&self) -> Result<Option<ScanSummary>> {
+            self.get_latest("SCAN").await
         }
 
         async fn news_for(&self, opportunity_id: Uuid) -> Result<Option<NewsEvidence>> {

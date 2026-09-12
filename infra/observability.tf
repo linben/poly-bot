@@ -1,18 +1,3 @@
-resource "aws_cloudwatch_metric_alarm" "api_errors" {
-  alarm_name          = "${var.project_name}-api-errors"
-  namespace           = "AWS/Lambda"
-  metric_name         = "Errors"
-  statistic           = "Sum"
-  period              = 300
-  evaluation_periods  = 1
-  threshold           = 0
-  comparison_operator = "GreaterThanThreshold"
-  treat_missing_data  = "notBreaching"
-  dimensions = {
-    FunctionName = aws_lambda_function.api.function_name
-  }
-}
-
 resource "aws_cloudwatch_metric_alarm" "news_errors" {
   alarm_name          = "${var.project_name}-news-errors"
   namespace           = "AWS/Lambda"
