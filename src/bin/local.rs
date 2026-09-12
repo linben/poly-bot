@@ -95,16 +95,16 @@ async fn main() -> Result<()> {
         reviewer.as_ref().map(|reviewer| reviewer.name()),
     ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let engine = tokio::spawn(engine_loop(
-        Arc::clone(&scanner),
-        Arc::clone(&store),
+    let engine = tokio::spawn(engine_loop(Engine {
+        scanner: Arc::clone(&scanner),
+        store: Arc::clone(&store),
         reviewer,
         news_refresh,
-        settings.clone(),
+        settings: settings.clone(),
         port,
-        shutdown_tx.clone(),
-        shutdown_rx.clone(),
-    ));
+        shutdown_tx: shutdown_tx.clone(),
+        shutdown_rx: shutdown_rx.clone(),
+    }));
 
     if interactive {
         let ui = tui::run(TuiOptions {
@@ -131,38 +131,53 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Scan on a fixed cadence (a slow scan delays the next tick), drain the news
-/// queue between scans, prune old snapshots, and publish status for the UI.
-#[allow(clippy::too_many_arguments)]
-async fn engine_loop(
+/// Everything the engine loop owns. One struct rather than a long argument
+/// list so the loop and its helpers share names.
+struct Engine {
     scanner: Arc<Scanner>,
     store: Arc<dyn Store>,
     reviewer: Option<SharedReviewer>,
     news_refresh: Duration,
     settings: Settings,
-    mut port: EnginePort,
+    port: EnginePort,
     shutdown_tx: watch::Sender<bool>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
-    let retention = Duration::from_secs(u64::from(settings.retention_days) * 86_400);
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Scan on a fixed cadence (a slow scan delays the next tick), drain the news
+/// queue between scans, prune old snapshots, and publish status for the UI.
+async fn engine_loop(mut engine: Engine) {
+    let retention = Duration::from_secs(u64::from(engine.settings.retention_days) * 86_400);
     let mut news_ticker = interval(Duration::from_secs(20));
     news_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut next_scan = Instant::now();
     loop {
-        if *shutdown_rx.borrow() {
-            port.status
+        if *engine.shutdown_rx.borrow() {
+            engine
+                .port
+                .status
                 .send_modify(|status| status.phase = Phase::ShuttingDown);
             return;
         }
+        let Engine {
+            scanner,
+            store,
+            reviewer,
+            news_refresh,
+            settings,
+            port,
+            shutdown_tx,
+            shutdown_rx,
+        } = &mut engine;
         tokio::select! {
             _ = sleep_until(next_scan) => {
                 next_scan = Instant::now() + settings.scan_interval;
-                run_scan(&scanner, &store, &settings, &port, retention).await;
+                run_scan(scanner, store, settings, port, retention).await;
             }
             _ = news_ticker.tick() => {
-                if let Some(reviewer) = &reviewer {
+                if let Some(reviewer) = reviewer {
                     port.status.send_modify(|status| status.phase = Phase::Reviewing);
-                    match process_news_queue(store.as_ref(), reviewer.as_ref(), news_refresh).await {
+                    match process_news_queue(store.as_ref(), reviewer.as_ref(), *news_refresh).await {
                         Ok(0) => {}
                         Ok(reviewed) => {
                             info!(reviewed, "news pass complete");

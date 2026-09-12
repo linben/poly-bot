@@ -278,6 +278,8 @@ pub struct Opportunity {
     pub source_count: usize,
     pub family_count: usize,
     pub source_ids: Vec<String>,
+    /// Scheduled start of the underlying game or match.
+    pub start_time: DateTime<Utc>,
     pub book_time: DateTime<Utc>,
     pub reasons: Vec<String>,
 }

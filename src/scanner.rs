@@ -449,6 +449,7 @@ mod tests {
             source_count: source_ids.len(),
             family_count: source_ids.len(),
             source_ids: source_ids.iter().map(|id| id.to_string()).collect(),
+            start_time: Utc::now() + chrono::Duration::hours(2),
             book_time: Utc::now(),
             reasons: Vec::new(),
         }

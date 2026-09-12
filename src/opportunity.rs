@@ -233,6 +233,7 @@ impl OpportunityEngine {
             source_count: consensus.source_count,
             family_count: consensus.family_count,
             source_ids: consensus.source_ids.clone(),
+            start_time: market.start_time,
             book_time: book.transact_time,
             reasons,
         }

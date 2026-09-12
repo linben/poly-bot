@@ -74,14 +74,22 @@ impl LocalStore {
         Ok(Self { root })
     }
 
+    /// Write to a sibling temp file and rename over the target. `latest-*.json`
+    /// and `portfolio.json` are re-read every couple of seconds by the UI, and
+    /// rename is the only atomic replace a plain filesystem offers.
     fn write_json(&self, path: &Path, value: &impl serde::Serialize) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| Error::Storage(format!("create {}: {error}", parent.display())))?;
         }
         let content = serde_json::to_vec_pretty(value)?;
-        fs::write(path, content)
-            .map_err(|error| Error::Storage(format!("write {}: {error}", path.display())))
+        let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        fs::write(&temporary, content)
+            .map_err(|error| Error::Storage(format!("write {}: {error}", temporary.display())))?;
+        fs::rename(&temporary, path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            Error::Storage(format!("replace {}: {error}", path.display()))
+        })
     }
 
     fn append_json_line(&self, path: &Path, value: &impl serde::Serialize) -> Result<()> {

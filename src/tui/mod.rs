@@ -371,7 +371,7 @@ async fn handle_key(
                 Outcome::Redraw
             }
             None => {
-                let _ = refresh_tx.send(refresh_tx.borrow().wrapping_add(1));
+                refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
                 app.notify("store reloaded", Tone::Accent);
                 Outcome::Redraw
             }
@@ -531,5 +531,77 @@ async fn paper_action(
         Ok(message) => app.notify(message, Tone::Good),
         Err(error) => app.notify(error.to_string(), Tone::Bad),
     }
-    let _ = refresh_tx.send(refresh_tx.borrow().wrapping_add(1));
+    refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{domain::PaperPortfolio, storage::LocalStore};
+
+    fn app(store_view: StoreView) -> App {
+        App {
+            settings: Settings::default(),
+            view: View::Portfolio,
+            store: Arc::new(store_view),
+            engine: None,
+            logs: None,
+            sort: SortKey::NetEdge,
+            sport_filter: None,
+            markets_cursor: 0,
+            show_detail: true,
+            portfolio_cursor: 0,
+            log_scroll: 0,
+            notice: None,
+            tick: 0,
+            attached: true,
+        }
+    }
+
+    /// The refresh signal is sent from the same task that also holds the
+    /// receiver; a borrow guard alive across `send` deadlocks the watch lock and
+    /// freezes the whole UI. A deadlock blocks its runtime thread, so the action
+    /// runs on a helper thread and the test waits with a plain timeout.
+    #[test]
+    fn paper_action_reports_and_requests_refresh_without_blocking() {
+        let directory = std::env::temp_dir().join(format!("polybot-tui-{}", Uuid::new_v4()));
+        let store = LocalStore::new(&directory).unwrap();
+        let (refresh_tx, refresh_rx) = watch::channel(0u64);
+        let mut app = app(StoreView {
+            loaded_at: Utc::now(),
+            scan: None,
+            rows: Vec::new(),
+            portfolio: PaperPortfolio {
+                bankroll: rust_decimal::Decimal::ONE_HUNDRED,
+                open_exposure: rust_decimal::Decimal::ZERO,
+                open_positions: Vec::new(),
+            },
+            error: None,
+            stats: data::EdgeStats::default(),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(paper_action(
+                &mut app,
+                &store,
+                &refresh_tx,
+                PaperAction::Close(Uuid::new_v4()),
+            ));
+            let _ = done_tx.send(app.notice.take());
+        });
+        let notice = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("paper action deadlocked on the refresh channel")
+            .expect("closing a missing position reports an error");
+        assert_eq!(*refresh_rx.borrow(), 1);
+        assert_eq!(notice.tone, Tone::Bad);
+        assert!(notice.text.contains("not found"));
+        std::fs::remove_dir_all(directory).ok();
+    }
 }

@@ -529,6 +529,7 @@ mod tests {
             source_count: 0,
             family_count: 0,
             source_ids: Vec::new(),
+            start_time: Utc::now() + chrono::Duration::hours(2),
             book_time: Utc::now(),
             reasons: Vec::new(),
         }
