@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Error, Result,
     domain::SourceFamily,
-    sources::{CanonicalJsonSource, SharedSource, TheOddsApiSource},
+    sources::{
+        CanonicalJsonSource, EspnOddsSource, KalshiSource, PolymarketGlobalSource, SharedSource,
+        TheOddsApiSource,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +55,9 @@ impl SourceCatalog {
         })
     }
 
+    /// Direct canonical adapters from `SOURCE_<BOOK>_URL`, the built-in public
+    /// adapters (enabled unless `ENABLE_<NAME>=false`), and The Odds API as a
+    /// confirmation-tier source when `ENABLE_THE_ODDS_API=true` and a key is set.
     pub fn configured_sources(&self, timeout: Duration) -> Result<Vec<SharedSource>> {
         let mut sources: Vec<SharedSource> = Vec::new();
         for spec in &self.specs {
@@ -68,10 +74,16 @@ impl SourceCatalog {
             )?));
         }
 
-        let validator_enabled = env::var("ENABLE_THE_ODDS_API_VALIDATOR")
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if validator_enabled
+        if flag_enabled("ENABLE_ESPN_ODDS", true) {
+            sources.push(Arc::new(EspnOddsSource::new(timeout)?));
+        }
+        if flag_enabled("ENABLE_KALSHI", true) {
+            sources.push(Arc::new(KalshiSource::new(timeout)?));
+        }
+        if flag_enabled("ENABLE_POLYMARKET_GLOBAL", true) {
+            sources.push(Arc::new(PolymarketGlobalSource::new(timeout)?));
+        }
+        if flag_enabled("ENABLE_THE_ODDS_API", false)
             && let Ok(api_key) = env::var("THE_ODDS_API_KEY")
             && !api_key.trim().is_empty()
         {
@@ -84,6 +96,13 @@ impl SourceCatalog {
         self.specs
             .iter()
             .filter(|spec| spec.tier == SourceTier::Primary)
+    }
+}
+
+fn flag_enabled(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value.trim().eq_ignore_ascii_case("true"),
+        _ => default,
     }
 }
 
@@ -102,6 +121,10 @@ pub fn parse_family(value: &str) -> Result<SourceFamily> {
         "kambi" => Ok(SourceFamily::Kambi),
         "hard_rock" => Ok(SourceFamily::HardRock),
         "penn" => Ok(SourceFamily::Penn),
+        "bovada" => Ok(SourceFamily::Bovada),
+        "low_vig" => Ok(SourceFamily::LowVig),
+        "kalshi" => Ok(SourceFamily::Kalshi),
+        "polymarket_global" => Ok(SourceFamily::PolymarketGlobal),
         other => Err(Error::Config(format!("unknown source family {other}"))),
     }
 }

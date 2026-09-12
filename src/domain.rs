@@ -68,6 +68,15 @@ pub enum SourceFamily {
     Kambi,
     HardRock,
     Penn,
+    Bovada,
+    LowVig,
+    /// Kalshi regulated exchange; independent order flow, not a sportsbook.
+    Kalshi,
+    /// Polymarket global CLOB; separate participant pool from Polymarket US.
+    PolymarketGlobal,
+    /// A real book or exchange without a dedicated variant. Counts as its own
+    /// family but can never be a reference book.
+    Other(String),
     Validation(String),
 }
 
@@ -78,6 +87,39 @@ impl SourceFamily {
             Self::Pinnacle | Self::Circa | Self::Bookmaker | Self::BetOnline
         )
     }
+
+    /// Maps a The Odds API bookmaker key onto the family that owns it so
+    /// skins of one operator are never counted twice.
+    pub fn from_odds_api_key(key: &str) -> Self {
+        match key {
+            "pinnacle" => Self::Pinnacle,
+            "circasports" => Self::Circa,
+            "bookmaker" => Self::Bookmaker,
+            "betonlineag" => Self::BetOnline,
+            "bet365" | "bet365_au" => Self::Bet365,
+            "draftkings" => Self::DraftKings,
+            "fanduel" => Self::FanDuel,
+            "williamhill_us" | "williamhill" | "caesars" => Self::Caesars,
+            "betmgm" | "betmgm_uk" => Self::BetMgm,
+            "fanatics" => Self::Fanatics,
+            "betrivers" | "unibet_us" | "unibet_uk" | "unibet_eu" => Self::Kambi,
+            "hardrockbet" | "hardrockbet_az" | "hardrockbet_fl" | "hardrockbet_oh" => {
+                Self::HardRock
+            }
+            "espnbet" | "thescorebet" => Self::Penn,
+            "bovada" => Self::Bovada,
+            "lowvig" => Self::LowVig,
+            "kalshi" => Self::Kalshi,
+            "polymarket" => Self::PolymarketGlobal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+pub const DEFAULT_START_TIME_TOLERANCE_MINUTES: i64 = 15;
+
+fn default_start_time_tolerance() -> i64 {
+    DEFAULT_START_TIME_TOLERANCE_MINUTES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +133,10 @@ pub struct SourceQuote {
     pub participant_a_provider_ids: BTreeMap<String, String>,
     pub participant_b_provider_ids: BTreeMap<String, String>,
     pub start_time: DateTime<Utc>,
+    /// Widest start-time mismatch the matcher may accept. Sources that only
+    /// publish a calendar date set this large enough to cover the day.
+    #[serde(default = "default_start_time_tolerance")]
+    pub start_time_tolerance_minutes: i64,
     #[serde(with = "rust_decimal::serde::str")]
     pub decimal_odds_a: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -154,7 +200,10 @@ pub struct MarketBook {
     pub bids: Vec<BookLevel>,
     pub offers: Vec<BookLevel>,
     pub state: String,
+    /// Last time the venue changed this book. An unchanged book is still live.
     pub transact_time: DateTime<Utc>,
+    /// When this snapshot was retrieved; freshness is judged against this.
+    pub fetched_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

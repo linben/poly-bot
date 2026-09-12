@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::{
     Error, Result,
-    domain::{SourceFamily, SourceHealth, SourceQuote},
-    sources::{OddsSource, SourceSpec, probe_url},
+    domain::{SourceFamily, SourceHealth, SourceQuote, Sport},
+    sources::{OddsSource, SourceSpec, http_client, probe_url},
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -19,10 +19,7 @@ impl CanonicalJsonSource {
         Ok(Self {
             spec,
             endpoint,
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .user_agent("polybot-source-collector/0.1")
-                .build()?,
+            client: http_client(timeout)?,
         })
     }
 }
@@ -63,7 +60,7 @@ impl OddsSource for CanonicalJsonSource {
             .expect("catalog family was validated")
     }
 
-    async fn collect(&self) -> Result<Vec<SourceQuote>> {
+    async fn collect(&self, sports: &[Sport]) -> Result<Vec<SourceQuote>> {
         let payload: serde_json::Value = self
             .client
             .get(&self.endpoint)
@@ -73,6 +70,7 @@ impl OddsSource for CanonicalJsonSource {
             .json()
             .await?;
         let mut quotes = parse_canonical(payload)?;
+        quotes.retain(|quote| sports.contains(&quote.sport));
         for quote in &mut quotes {
             quote.source_id = self.spec.id.clone();
             quote.family = self.family();
@@ -86,7 +84,7 @@ impl OddsSource for CanonicalJsonSource {
         let mut health =
             probe_url(&self.client, &self.spec.id, self.family(), &self.endpoint).await;
         if health.reachable {
-            match self.collect().await {
+            match self.collect(&Sport::ALL).await {
                 Ok(quotes) => {
                     health.odds_found = quotes.len();
                     health.message = format!("{} normalized quotes", quotes.len());

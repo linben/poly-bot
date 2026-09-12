@@ -1,0 +1,15 @@
+[Unit]
+Description=Polybot local mode (scanner, news review, dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/poly-bot
+EnvironmentFile=%h/poly-bot/.env
+ExecStart=%h/poly-bot/target/release/local --data-dir %h/poly-bot/data
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

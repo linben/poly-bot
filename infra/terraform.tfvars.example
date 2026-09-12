@@ -6,3 +6,6 @@ bedrock_model_id = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 source_endpoints = {
   # pinnacle = "https://approved-adapter.example/pinnacle"
 }
+
+# Confirmation tier; put the_odds_api_key in the application secret first.
+enable_the_odds_api = false

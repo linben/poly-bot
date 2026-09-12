@@ -78,7 +78,9 @@ and news citations are retained so a recommendation can be reconstructed.
 - Polymarket US public API
 - Pregame full-game or match moneylines
 - NFL, NBA, WNBA, MLB, and tennis
-- Ten direct sportsbook source families every five minutes
+- Three free public continuous source families every five minutes (ESPN
+  odds, Kalshi, Polymarket global), plus a quota-limited multi-book
+  confirmation pass and any approved direct sportsbook adapters
 - Proportional de-vigging and robust median/MAD consensus
 - Provider-ID-first event matching
 - Multi-level YES and opposing-outcome execution pricing
@@ -121,7 +123,7 @@ rejected candidate.
 The first production phase is successful when:
 
 - Scheduled scans complete reliably every five minutes
-- All ten approved source adapters are monitored for freshness and failures
+- Every configured source adapter is monitored for freshness and failures
 - No actionable result violates matching, quorum, price, or exposure rules
 - Every actionable result has current news evidence and traceable citations
 - Paper positions and maximum loss remain internally consistent
