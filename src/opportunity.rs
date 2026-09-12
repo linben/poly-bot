@@ -94,16 +94,25 @@ impl OpportunityEngine {
             reasons.push(format!("market status is {}", market.ep3_status));
         }
         let book_age = Utc::now()
-            .signed_duration_since(book.transact_time)
+            .signed_duration_since(book.fetched_at)
             .num_seconds();
         if book_age < 0 || book_age > self.settings.book_max_age.as_secs() as i64 {
-            reasons.push(format!("book is {book_age}s old"));
+            reasons.push(format!("book snapshot is {book_age}s old"));
+        }
+        if book.transact_time > Utc::now() + chrono::Duration::minutes(1) {
+            reasons.push("book transact time is in the future".into());
         }
         if top_price < self.settings.minimum_price || top_price > self.settings.maximum_price {
-            reasons.push("executable price is outside 0.35-0.65".into());
+            reasons.push(format!(
+                "executable price {top_price} is outside {}-{}",
+                self.settings.minimum_price, self.settings.maximum_price
+            ));
         }
         if consensus.family_count < self.settings.watchlist_source_families {
-            reasons.push("fewer than three independent source families".into());
+            reasons.push(format!(
+                "fewer than {} independent source families",
+                self.settings.watchlist_source_families
+            ));
         }
         if portfolio.has_market_side(&market.market_id, side) {
             reasons.push("paper portfolio already has this market side".into());
@@ -147,7 +156,10 @@ impl OpportunityEngine {
             top_price
         };
         if executable < self.settings.minimum_price || executable > self.settings.maximum_price {
-            reasons.push("depth-weighted price is outside 0.35-0.65".into());
+            reasons.push(format!(
+                "depth-weighted price {executable} is outside {}-{}",
+                self.settings.minimum_price, self.settings.maximum_price
+            ));
         }
         let fee_per_contract = if sized.quantity > Decimal::ZERO {
             sized.estimated_fee / sized.quantity
@@ -157,10 +169,16 @@ impl OpportunityEngine {
         let raw_edge = fair - executable;
         let net_edge = conservative - executable - fee_per_contract;
         if raw_edge < self.settings.minimum_raw_edge {
-            reasons.push("raw edge is below five percentage points".into());
+            reasons.push(format!(
+                "raw edge {raw_edge} is below {}",
+                self.settings.minimum_raw_edge
+            ));
         }
         if net_edge < self.settings.minimum_net_edge {
-            reasons.push("conservative after-fee edge is below three percentage points".into());
+            reasons.push(format!(
+                "conservative after-fee edge {net_edge} is below {}",
+                self.settings.minimum_net_edge
+            ));
         }
 
         let hard_rejection = !reasons.is_empty();
@@ -175,7 +193,10 @@ impl OpportunityEngine {
         };
         if class == RecommendationClass::Watchlist {
             if consensus.family_count < self.settings.minimum_source_families {
-                reasons.push("requires five independent source families".into());
+                reasons.push(format!(
+                    "requires {} independent source families",
+                    self.settings.minimum_source_families
+                ));
             }
             if !consensus.has_reference {
                 reasons.push("requires a reference sportsbook".into());
@@ -280,6 +301,7 @@ mod tests {
             }],
             state: "MARKET_STATE_OPEN".into(),
             transact_time: Utc::now(),
+            fetched_at: Utc::now(),
         }
     }
 
@@ -326,7 +348,7 @@ mod tests {
     fn stale_or_suspended_book_is_rejected() {
         let mut book = book();
         book.state = "MARKET_STATE_SUSPENDED".into();
-        book.transact_time = Utc::now() - chrono::Duration::minutes(2);
+        book.fetched_at = Utc::now() - chrono::Duration::minutes(2);
         let opportunities = OpportunityEngine::new(Settings::default()).evaluate(
             &market(),
             &book,

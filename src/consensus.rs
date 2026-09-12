@@ -48,21 +48,30 @@ pub fn remove_vig(quote: &SourceQuote) -> Result<FairQuote> {
     })
 }
 
+/// Builds a robust consensus from quotes observed within `max_quote_age_seconds`.
+/// Freshness is judged by `fetched_at` (when we last saw the book display the
+/// line); `source_timestamp` is when the book last moved it and only breaks
+/// ties, because an unmoved line is still a live price.
 pub fn build_consensus(
     quotes: &[SourceQuote],
     max_quote_age_seconds: i64,
 ) -> Result<ConsensusPrice> {
-    let cutoff = Utc::now() - chrono::Duration::seconds(max_quote_age_seconds);
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::seconds(max_quote_age_seconds);
+    let future_limit = now + chrono::Duration::seconds(30);
     let mut newest_by_family: HashMap<SourceFamily, &SourceQuote> = HashMap::new();
     for quote in quotes.iter().filter(|quote| {
         !quote.validation_only
-            && quote.source_timestamp >= cutoff
-            && quote.source_timestamp <= Utc::now() + chrono::Duration::seconds(30)
+            && quote.fetched_at >= cutoff
+            && quote.fetched_at <= future_limit
+            && quote.source_timestamp <= future_limit
     }) {
         newest_by_family
             .entry(quote.family.clone())
             .and_modify(|current| {
-                if quote.source_timestamp > current.source_timestamp {
+                if (quote.fetched_at, quote.source_timestamp)
+                    > (current.fetched_at, current.source_timestamp)
+                {
                     *current = quote;
                 }
             })
@@ -158,6 +167,7 @@ mod tests {
             participant_a_provider_ids: BTreeMap::new(),
             participant_b_provider_ids: BTreeMap::new(),
             start_time: Utc::now(),
+            start_time_tolerance_minutes: 15,
             decimal_odds_a: Decimal::new(a, 2),
             decimal_odds_b: Decimal::new(b, 2),
             decimal_odds_neutral: None,
@@ -201,7 +211,7 @@ mod tests {
     #[test]
     fn consensus_excludes_stale_and_validation_only_quotes() {
         let mut stale = quote("stale", SourceFamily::Circa, 190, 200);
-        stale.source_timestamp = Utc::now() - chrono::Duration::minutes(20);
+        stale.fetched_at = Utc::now() - chrono::Duration::minutes(20);
         let mut validator = quote(
             "validator",
             SourceFamily::Validation("validator".into()),

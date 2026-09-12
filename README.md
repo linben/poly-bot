@@ -2,8 +2,10 @@
 
 Rust research and paper-risk tooling for pregame sports markets on the
 Polymarket US API. It scans NFL, NBA, WNBA, MLB, and tennis moneylines, compares
-the executable US order book with de-vigged sportsbook consensus, and enriches
-candidates with recent Brave Search evidence summarized by AWS Bedrock.
+the executable US order book with a de-vigged consensus built from free public
+odds sources (ESPN/DraftKings, Kalshi, Polymarket global) and an optional
+quota-limited multi-book confirmation feed, and enriches candidates with recent
+Brave Search evidence summarized by AWS Bedrock.
 
 This repository does not contain wallet credentials, exchange authentication,
 or order-submission code. It cannot place a live trade.
@@ -19,14 +21,17 @@ architecture and technology choices are documented in
 - Contract acquisition price: `$0.35` through `$0.65`
 - Paper bankroll: `$100`
 - Position risk: quarter Kelly, bounded to 1-5% of bankroll
-- Total open exposure: at most `$5`
 - Watchlist: at least three independent source families
 - Actionable consensus: at least five independent families, including a
   reference book
 - Edge: at least five percentage points raw and three percentage points after
   dispersion and fees
-- Confirmation: refetch three relevant books, replace their initial quotes,
-  and fail closed if the quorum no longer holds
+- Confirmation: when any candidate survives the continuous pass, refetch up to
+  three contributing continuous sources plus every confirmation-tier source
+  (The Odds API) for the candidate sports, replace their initial quotes, and
+  fail closed if the quorum no longer holds
+- Freshness: a quote is fresh by when it was last observed, not by when the
+  book last moved the line; an unmoved line is still a live price
 - News gate: a candidate remains watchlist until Bedrock returns corroborated
   `unchanged` evidence; `lower`, `review`, and `reject` downgrade it
 - News cache: stable market-side IDs reuse evidence for one hour; evidence
@@ -40,7 +45,47 @@ Polymarket US exposes one YES book. The engine interprets:
 Sizing walks all eligible book levels, calculates a side-specific VWAP, and
 applies fee rounding at each consumed level.
 
-## Why ECS and Lambda
+## Run Modes
+
+`RUN_MODE` selects where state lives and which services run. Both modes share
+the same scanner, consensus, sizing, and news logic.
+
+| | `local` (default) | `cloud` |
+| --- | --- | --- |
+| Process | one `local` binary: scan loop, news loop, retention, dashboard | ECS one-shot `scanner`, Lambda `news-worker`, Lambda `api` |
+| Store | files under `data/` (`scans/`, `latest-opportunities.json`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
+| News reviewer | `keyword` (Brave + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
+| Dashboard | `http://127.0.0.1:8080`, no auth | CloudFront + Cognito |
+| Requires | Rust toolchain, outbound HTTPS | AWS account, Terraform, Docker, cargo-lambda |
+
+### Local mode
+
+```bash
+cp .env.example .env            # optional: add THE_ODDS_API_KEY / BRAVE_SEARCH_API_KEY
+set -a; source .env; set +a
+make local                      # or: cargo run --release --bin local
+make local-once                 # one scan + one news pass, then exit
+```
+
+`local` runs a fixed-cadence scan (`SCAN_INTERVAL_SECONDS`, default 300),
+drains the news queue every 20 s, prunes scan snapshots older than
+`LOCAL_RETENTION_DAYS` (default 14), and serves the dashboard on
+`LISTEN_ADDRESS`. A failed scan is logged and retried next tick; only
+configuration errors exit. `deploy/polybot-local.service` is a user systemd
+unit for unattended operation. Logs go to stderr, JSON to stdout.
+
+Measured on 2026-09-12 against live APIs (release build): a cold scan takes
+about 3.3 s, of which market discovery is 2.2-2.5 s of Polymarket server time
+(an NFL events page is 42 MB uncompressed, 1.4 MB gzip); discovery is cached
+for `DISCOVERY_REFRESH_SECONDS` (default 900), so steady-state scans finish
+in about 0.5 s: three sources collected concurrently (~0.3 s) and all ~90
+matched books fetched in parallel (`POLYMARKET_CONCURRENCY`, default 8;
+measured ~20 ms per book with no throttling at 32 concurrent). Before this
+work a scan took ~24 s, dominated by a serial 110 ms per-request throttle.
+Started games are dropped at evaluation time so the discovery cache cannot
+leak an in-play book.
+
+### Cloud mode
 
 The five-minute scanner runs as a scheduled one-shot ECS Fargate task. It can
 perform concurrent network collection without Lambda's packaging and duration
@@ -56,42 +101,49 @@ recommendations, news evidence, paper portfolio state, and the scanner lease.
 CloudFront serves a private S3 dashboard and routes `/api/*` to API Gateway.
 Cognito uses authorization code flow with PKCE.
 
-## Sportsbook Sources
+### News reviewers
 
-`config/sources.json` defines ten preferred books:
+`NEWS_REVIEWER` picks how candidates are vetted. Every reviewer can only
+preserve or downgrade a candidate.
 
-1. Pinnacle
-2. Circa
-3. Bookmaker.eu
-4. BetOnline
-5. bet365
-6. DraftKings
-7. FanDuel
-8. Caesars
-9. BetMGM
-10. Fanatics
+- `keyword` (default when `BRAVE_SEARCH_API_KEY` is set): Brave Search, then a
+  deterministic classifier. A citation counts only if it names the participant;
+  hard terms (ruled out, scratched, suspended, withdrawn, postponed, ...) force
+  `review` with manual review, soft terms (questionable, doubtful, injury,
+  weather delay) give `lower`, otherwise `unchanged`. No citations at all is
+  `review`.
+- `bedrock`: Brave Search summarized by Bedrock (build with `--features aws`).
+- none (default without a Brave key): no evidence is written, so nothing can
+  leave the watchlist.
+- `off`: records `unchanged` without searching. This removes the news veto and
+  is only for operators who review every candidate by hand.
 
-BetRivers, Hard Rock Bet, and theScore Bet are fallbacks. The source-family
-model prevents multiple skins from being counted as independent evidence.
+## Odds Sources
 
-There is no free hosted odds API with enough allowance to collect ten books
-across five sports every five minutes. The free services reviewed are useful
-only as sampled validators:
+Three continuous sources run every scan. They are public, unauthenticated, and
+unmetered, and each is one independent family:
 
-| Service | Free allowance reviewed | Use |
-| --- | ---: | --- |
-| Odds-API.io | 500 requests/day | Occasional comparison |
-| The Odds API | 500 requests/month | Opt-in validator |
-| SportsGameOdds | 2,500 objects/month | Fixture/sampled validation |
+| Source | Family | Sports | Notes |
+| --- | --- | --- | --- |
+| ESPN core odds | `draft_kings` (per provider ESPN serves) | NFL, NBA, WNBA, MLB | Current-week scoreboard only; American odds converted to decimal |
+| Kalshi public market API | `kalshi` | NFL, NBA, WNBA, MLB | `1 / yes ask` per side; skipped when spread > 6c; NFL/NBA rules carry only a date, so the quote uses a 14-hour start tolerance |
+| Polymarket global Gamma | `polymarket_global` | NFL, NBA, WNBA, MLB, tennis | `1 / ask` and `1 / (1 - bid)`; liquidity floor `POLYMARKET_GLOBAL_MIN_LIQUIDITY`, spread <= 4c |
 
-The Odds API adapter is disabled unless both
-`ENABLE_THE_ODDS_API_VALIDATOR=true` and `THE_ODDS_API_KEY` are set. It is
-excluded from consensus under all conditions.
+Three families reach the watchlist quorum, never the actionable one. The Odds
+API (`ENABLE_THE_ODDS_API=true` plus `THE_ODDS_API_KEY`) is the confirmation
+tier: it is only queried for sports that already have a candidate, one
+request per sport returns every US and EU book (Pinnacle, BetOnline, FanDuel,
+BetMGM, Caesars, ...), each mapped onto its owning family so skins are counted
+once, and it stops spending below `THE_ODDS_API_MIN_REMAINING` credits. On the
+free plan (500 credits/month, `us,eu` = 2 credits per sport) that is roughly
+four confirmations a day, which is plenty because candidates are rare.
 
-Every direct book must pass a feasibility and terms review before its endpoint
-is configured. Collection must not bypass authentication, CAPTCHA,
-geolocation, access controls, or other restrictions. The application accepts
-only approved public adapters that emit this canonical JSON:
+`config/sources.json` still defines the direct book catalog. Set
+`SOURCE_<BOOK>_URL` to an approved adapter emitting the canonical JSON below
+and it joins the continuous pass as its own family. Every direct book must
+pass a feasibility and terms review before its endpoint is configured.
+Collection must not bypass authentication, CAPTCHA, geolocation, access
+controls, or other restrictions.
 
 ```json
 {
@@ -105,6 +157,7 @@ only approved public adapters that emit this canonical JSON:
     "participant_a_provider_ids": {"sportradar": "sr:team:1"},
     "participant_b_provider_ids": {"sportradar": "sr:team:2"},
     "start_time": "2026-08-07T02:00:00Z",
+    "start_time_tolerance_minutes": 15,
     "decimal_odds_a": "1.90",
     "decimal_odds_b": "2.00",
     "decimal_odds_neutral": null,
@@ -116,14 +169,30 @@ only approved public adapters that emit this canonical JSON:
 }
 ```
 
-Set each approved adapter URL through its `SOURCE_<BOOK>_URL` environment
-variable. A configured URL is not proof that collection is permitted; record
-the approval and parser owner outside this service.
+Event matching prefers shared provider IDs (Polymarket US publishes Sportradar
+and SportsDataIO team IDs). Name matching uses the canonical team name from the
+market side's `team.name`, and accepts a source's city or short form
+("Kansas City", "Los Angeles R") only when both participants resolve to
+distinct sides; "Chicago" against Cubs and White Sox is rejected.
+
+### What the data says
+
+A live scan on 2026-09-12 (84 NFL and MLB moneylines) found Polymarket US
+books with a half-cent spread and six-figure contract depth at the top three
+levels. Against DraftKings the US midpoint differed by 0.07 pp on average
+with a 0.74 pp standard deviation and a 2.2 pp maximum; against Kalshi the
+standard deviation was 0.97 pp. A raw edge of five points is therefore rare
+and, when it appears from one family only, has so far been a stale or
+placeholder quote (a fresh global market seeded at 0.50/0.51 while the US
+book sat at 0.72). The quorum exists to reject exactly that. Real candidates
+should come from venues disagreeing after news (a starting pitcher change
+moved Kalshi and Polymarket global four points before the US book followed),
+so scans are most useful in the hours before first pitch and around NFL
+inactive reports.
 
 The reviewed `polymm` repository contributed useful concepts around de-vigging,
 limit pricing, matching, and adverse selection. Its Polygon wallet/order code,
 Supabase persistence, and non-US CLOB assumptions are intentionally not used.
-Its private scraper pipeline is not present in that repository.
 
 The supplied PredictEngine article is marketing material, not performance
 evidence. Its stated backtest results, user counts, bonuses, and claims of
@@ -134,16 +203,14 @@ evidence. Its stated backtest results, user counts, bonuses, and claims of
 Prerequisites:
 
 - Rust 1.90 or newer
-- Terraform 1.8 or newer
-- Docker for the scanner image
-- `cargo-lambda` for Lambda archives
+- For cloud mode only: Terraform 1.8+, Docker, `cargo-lambda`
 
 ```bash
 cp .env.example .env
 set -a; source .env; set +a
 cargo test --all-features
-cargo run --bin source-probe
-cargo run --bin api
+cargo run --bin source-probe -- --adapters-only
+make local-once
 ```
 
 The local dashboard listens on `http://127.0.0.1:8080` by default. Scanner
@@ -158,14 +225,18 @@ cargo run --bin paper -- open <opportunity-uuid>
 cargo run --bin paper -- close <opportunity-uuid>
 ```
 
-`cargo run --bin scanner` intentionally fails until ten independent direct
-source endpoints, including a reference book, are configured. An empty
-successful scan would hide a broken production feed.
+`cargo run --bin scanner` performs one scan and exits (the cloud task shape;
+`--continuous` loops). All binaries start with the three built-in public
+sources and fail at startup with fewer than three distinct continuous
+families (`MINIMUM_CONFIGURED_SOURCES`). Without a confirmation-tier source or
+a reference book they log a warning: results can reach the watchlist but never
+become actionable.
 
-`source-probe` checks only public homepages for basic reachability. It does not
-approve a source or discover private endpoints.
+`source-probe` runs a real collection through every configured adapter and
+reports quote counts and latency; with `--adapters-only` it skips the catalog
+homepage reachability checks. Logs go to stderr, JSON results to stdout.
 
-## AWS Deployment
+## AWS Deployment (cloud mode)
 
 1. Populate the Terraform variables and create the managed ECR repository.
 2. Build and push the scanner image using the immutable configured tag.
@@ -190,7 +261,7 @@ terraform -chdir=infra apply
 
 aws secretsmanager put-secret-value \
   --secret-id "$(terraform -chdir=infra output -raw application_secret_id)" \
-  --secret-string '{"brave_search_api_key":"replace-me"}'
+  --secret-string '{"brave_search_api_key":"replace-me","the_odds_api_key":"optional"}'
 
 aws cognito-idp admin-create-user \
   --user-pool-id "$(terraform -chdir=infra output -raw cognito_user_pool_id)" \

@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -27,6 +28,30 @@ pub trait Store: Send + Sync {
     async fn news_for(&self, opportunity_id: Uuid) -> Result<Option<NewsEvidence>>;
     async fn enqueue_news(&self, opportunities: &[Opportunity]) -> Result<()>;
     async fn save_news(&self, evidence: &NewsEvidence) -> Result<()>;
+    /// Remove and return every queued news candidate. Stores whose queue is
+    /// consumed elsewhere (SQS) return nothing.
+    async fn take_news_queue(&self) -> Result<Vec<Opportunity>> {
+        Ok(Vec::new())
+    }
+    /// Delete scan history older than `retention`. No-op for stores with
+    /// lifecycle rules of their own.
+    async fn prune(&self, _retention: Duration) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+/// Build the store for the configured run mode. Cloud requires the `aws`
+/// feature and `DATA_BUCKET`/`STATE_TABLE`/`NEWS_QUEUE_URL`.
+pub async fn store_for(mode: crate::config::RunMode, data_dir: &str) -> Result<Arc<dyn Store>> {
+    match mode {
+        crate::config::RunMode::Local => Ok(Arc::new(LocalStore::new(data_dir)?)),
+        #[cfg(feature = "aws")]
+        crate::config::RunMode::Cloud => Ok(Arc::new(aws::AwsStore::from_env().await?)),
+        #[cfg(not(feature = "aws"))]
+        crate::config::RunMode::Cloud => Err(Error::Config(
+            "RUN_MODE=cloud requires a build with the aws feature".into(),
+        )),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -174,7 +199,13 @@ impl Store for LocalStore {
             &self.root.join("latest-opportunities.json"),
             &snapshot.opportunities,
         )?;
-        for opportunity in &snapshot.opportunities {
+        // Rejected rows live in the per-scan snapshot; the running history
+        // only keeps candidates so it stays small enough to grep.
+        for opportunity in snapshot
+            .opportunities
+            .iter()
+            .filter(|item| item.class != crate::domain::RecommendationClass::Rejected)
+        {
             self.append_json_line(&self.root.join("opportunities.ndjson"), opportunity)?;
         }
         Ok(())
@@ -218,6 +249,66 @@ impl Store for LocalStore {
                 .join(format!("{}.json", evidence.opportunity_id)),
             evidence,
         )
+    }
+
+    async fn take_news_queue(&self) -> Result<Vec<Opportunity>> {
+        let path = self.root.join("news-queue.ndjson");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        // Rename first so a concurrent scan appends to a fresh file instead of
+        // racing the read.
+        let taken = self.root.join("news-queue.processing.ndjson");
+        fs::rename(&path, &taken)
+            .map_err(|error| Error::Storage(format!("rotate {}: {error}", path.display())))?;
+        let content = fs::read_to_string(&taken)
+            .map_err(|error| Error::Storage(format!("read {}: {error}", taken.display())))?;
+        let mut queued = Vec::new();
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match serde_json::from_str::<Opportunity>(line) {
+                Ok(opportunity) => queued.push(opportunity),
+                Err(error) => tracing::warn!(%error, "skipping malformed news queue line"),
+            }
+        }
+        fs::remove_file(&taken)
+            .map_err(|error| Error::Storage(format!("remove {}: {error}", taken.display())))?;
+        Ok(queued)
+    }
+
+    async fn prune(&self, retention: Duration) -> Result<usize> {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(retention)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let scans = self.root.join("scans");
+        if !scans.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        let mut stack = vec![scans];
+        while let Some(directory) = stack.pop() {
+            let entries = fs::read_dir(&directory).map_err(|error| {
+                Error::Storage(format!("read {}: {error}", directory.display()))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| Error::Storage(error.to_string()))?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(|error| Error::Storage(error.to_string()))?;
+                if modified < cutoff {
+                    fs::remove_file(&path).map_err(|error| {
+                        Error::Storage(format!("remove {}: {error}", path.display()))
+                    })?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 }
 

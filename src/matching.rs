@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::domain::{SourceQuote, UsMoneylineMarket};
+use crate::domain::{DEFAULT_START_TIME_TOLERANCE_MINUTES, SourceQuote, UsMoneylineMarket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteOrientation {
@@ -12,8 +12,11 @@ pub fn match_quote(market: &UsMoneylineMarket, quote: &SourceQuote) -> Option<Qu
     if market.sport != quote.sport {
         return None;
     }
+    let tolerance = quote
+        .start_time_tolerance_minutes
+        .max(DEFAULT_START_TIME_TOLERANCE_MINUTES);
     let start_delta = (market.start_time - quote.start_time).num_minutes().abs();
-    if start_delta > 15 {
+    if start_delta > tolerance {
         return None;
     }
 
@@ -41,13 +44,24 @@ pub fn match_quote(market: &UsMoneylineMarket, quote: &SourceQuote) -> Option<Qu
     let short = normalize_participant(&market.short_participant.name);
     let a = normalize_participant(&quote.participant_a);
     let b = normalize_participant(&quote.participant_b);
-    if long == a && short == b {
-        Some(QuoteOrientation::Direct)
-    } else if long == b && short == a {
-        Some(QuoteOrientation::Swapped)
-    } else {
-        None
+    let direct = names_match(&long, &a) && names_match(&short, &b);
+    let swapped = names_match(&long, &b) && names_match(&short, &a);
+    match (direct, swapped) {
+        (true, false) => Some(QuoteOrientation::Direct),
+        (false, true) => Some(QuoteOrientation::Swapped),
+        // Ambiguous (e.g. "chicago" against Cubs and White Sox) or no match.
+        _ => None,
     }
+}
+
+/// Exact normalized equality, or the quote name is a city/short-form prefix
+/// of the market name ("kansascity" -> "kansascityroyals", "losangelesr" ->
+/// "losangelesrams"). The prefix rule is only safe because the caller demands
+/// that both participants resolve to distinct sides.
+fn names_match(market_name: &str, quote_name: &str) -> bool {
+    const MINIMUM_PREFIX: usize = 5;
+    market_name == quote_name
+        || (quote_name.len() >= MINIMUM_PREFIX && market_name.starts_with(quote_name))
 }
 
 pub fn orient_quote(quote: &SourceQuote, orientation: QuoteOrientation) -> SourceQuote {
@@ -143,6 +157,7 @@ mod tests {
             participant_a_provider_ids: BTreeMap::new(),
             participant_b_provider_ids: BTreeMap::new(),
             start_time: Utc::now() + chrono::Duration::hours(2),
+            start_time_tolerance_minutes: 15,
             decimal_odds_a: Decimal::new(19, 1),
             decimal_odds_b: Decimal::new(2, 0),
             decimal_odds_neutral: None,
@@ -216,5 +231,36 @@ mod tests {
             match_quote(&market, &quote),
             Some(QuoteOrientation::Swapped)
         );
+    }
+
+    #[test]
+    fn city_prefix_matches_when_both_sides_are_distinct() {
+        let mut market = market("Kansas City Royals", "Boston Red Sox");
+        market.sport = Sport::Mlb;
+        let mut quote = quote("Boston", "Kansas City");
+        quote.sport = Sport::Mlb;
+        assert_eq!(
+            match_quote(&market, &quote),
+            Some(QuoteOrientation::Swapped)
+        );
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_rejected() {
+        let mut market = market("Chicago Cubs", "Chicago White Sox");
+        market.sport = Sport::Mlb;
+        let mut quote = quote("Chicago", "Chicago");
+        quote.sport = Sport::Mlb;
+        assert_eq!(match_quote(&market, &quote), None);
+    }
+
+    #[test]
+    fn date_only_quotes_use_their_wider_tolerance() {
+        let market = market("Ruehl / Veldheer", "Jones / Smith");
+        let mut quote = quote("Ruehl/Veldheer", "Jones/Smith");
+        quote.start_time = market.start_time - chrono::Duration::hours(9);
+        assert_eq!(match_quote(&market, &quote), None);
+        quote.start_time_tolerance_minutes = 14 * 60;
+        assert_eq!(match_quote(&market, &quote), Some(QuoteOrientation::Direct));
     }
 }

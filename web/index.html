@@ -192,33 +192,38 @@
       history.replaceState(null, "", location.pathname);
       return payload.access_token;
     }
-    accessToken().then(token => {
-      if (!token && config.authorizeUrl) {
-        document.querySelector("#status").textContent = "Sign in required";
-        return null;
-      }
-      const headers = { accept: "application/json" };
-      if (token) headers.authorization = `Bearer ${token}`;
-      return fetch("/api/opportunities", { headers }).then(response => {
-        if (response.status === 401 && config.authorizeUrl) {
-          sessionStorage.removeItem("access_token");
-          throw new Error("Session expired");
+    function load() {
+      return accessToken().then(token => {
+        if (!token && config.authorizeUrl) {
+          document.querySelector("#status").textContent = "Sign in required";
+          return null;
         }
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
-      });
-    })
-      .then(items => {
-        if (items === null) return;
-        state.items = items;
-        document.querySelector("#status").textContent =
-          `${items.length} records | refreshed ${new Date().toLocaleTimeString()}`;
-        render();
+        const headers = { accept: "application/json" };
+        if (token) headers.authorization = `Bearer ${token}`;
+        return fetch("/api/opportunities", { headers }).then(response => {
+          if (response.status === 401 && config.authorizeUrl) {
+            sessionStorage.removeItem("access_token");
+            throw new Error("Session expired");
+          }
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        });
       })
-      .catch(error => {
-        document.querySelector("#status").textContent = `Unable to load: ${error.message}`;
-        render();
-      });
+        .then(items => {
+          if (items === null) return;
+          state.items = items;
+          document.querySelector("#status").textContent =
+            `${items.length} records | refreshed ${new Date().toLocaleTimeString()}`;
+          render();
+        })
+        .catch(error => {
+          document.querySelector("#status").textContent = `Unable to load: ${error.message}`;
+          render();
+        });
+    }
+    load();
+    // Local mode runs unattended; pick up each scan without a reload.
+    setInterval(load, (config.refreshSeconds || 60) * 1000);
   </script>
 </body>
 </html>

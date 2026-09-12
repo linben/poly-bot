@@ -117,12 +117,17 @@ resource "aws_ecs_task_definition" "scanner" {
     image     = "${aws_ecr_repository.scanner.repository_url}:${var.scanner_image_tag}"
     essential = true
     environment = concat([
-      { name = "STORAGE_MODE", value = "aws" },
+      { name = "RUN_MODE", value = "cloud" },
       { name = "DATA_BUCKET", value = aws_s3_bucket.data.id },
       { name = "STATE_TABLE", value = aws_dynamodb_table.state.name },
       { name = "NEWS_QUEUE_URL", value = aws_sqs_queue.news.url },
+      { name = "ENABLE_THE_ODDS_API", value = var.enable_the_odds_api ? "true" : "false" },
       { name = "RUST_LOG", value = "polybot=info" }
     ], local.source_environment)
+    secrets = var.enable_the_odds_api ? [{
+      name      = "THE_ODDS_API_KEY"
+      valueFrom = "${aws_secretsmanager_secret.app.arn}:the_odds_api_key::"
+    }] : []
     logConfiguration = {
       logDriver = "awslogs"
       options = {

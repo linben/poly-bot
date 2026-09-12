@@ -1,12 +1,10 @@
-use std::sync::Arc;
-
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use polybot::{
     Error, Result,
     config::Settings,
     domain::{PaperPosition, RecommendationClass, ResearchOpportunity},
-    storage::{LocalStore, Store},
+    storage::store_for,
 };
 use uuid::Uuid;
 
@@ -30,15 +28,7 @@ async fn main() -> Result<()> {
     polybot::init_tracing();
     let args = Args::parse();
     let settings = Settings::from_env()?;
-
-    #[cfg(feature = "aws")]
-    let store: Arc<dyn Store> = if std::env::var("STORAGE_MODE").as_deref() == Ok("aws") {
-        Arc::new(polybot::storage::aws::AwsStore::from_env().await?)
-    } else {
-        Arc::new(LocalStore::new(&args.data_dir)?)
-    };
-    #[cfg(not(feature = "aws"))]
-    let store: Arc<dyn Store> = Arc::new(LocalStore::new(&args.data_dir)?);
+    let store = store_for(settings.run_mode, &args.data_dir).await?;
 
     let mut portfolio = store.load_portfolio(settings.bankroll).await?;
     match args.command {

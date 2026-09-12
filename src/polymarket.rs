@@ -1,41 +1,57 @@
 use std::{cmp::Reverse, collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, future, stream};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 use crate::{
     Error, Result,
     domain::{BookLevel, MarketBook, MarketParticipant, Sport, UsMoneylineMarket},
 };
 
+/// Polymarket US public gateway. Measured 2026-09: book requests answer in
+/// ~20 ms and 32 concurrent requests were not throttled; an NFL events page
+/// is 42 MB uncompressed (1.4 MB gzip) and takes ~2 s server-side, so
+/// discovery runs all sports concurrently and callers cache the result.
 #[derive(Clone)]
 pub struct PolymarketUsClient {
     base_url: String,
     client: Client,
-    last_request: Arc<Mutex<Option<tokio::time::Instant>>>,
+    permits: Arc<Semaphore>,
+    concurrency: usize,
 }
 
 impl PolymarketUsClient {
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self> {
+        Self::with_concurrency(base_url, timeout, 8)
+    }
+
+    pub fn with_concurrency(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        concurrency: usize,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(timeout)
-            .user_agent("polybot-research/0.1")
+            .user_agent(crate::sources::USER_AGENT)
+            .gzip(true)
             .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
-            last_request: Arc::new(Mutex::new(None)),
+            permits: Arc::new(Semaphore::new(concurrency.max(1))),
+            concurrency: concurrency.max(1),
         })
     }
 
     pub async fn discover_moneylines(&self) -> Result<Vec<UsMoneylineMarket>> {
-        let mut markets = Vec::new();
-        for sport in Sport::ALL {
-            markets.extend(self.discover_sport(sport).await?);
-        }
+        let per_sport =
+            future::try_join_all(Sport::ALL.iter().map(|sport| self.discover_sport(*sport)))
+                .await?;
+        let mut markets = per_sport.into_iter().flatten().collect::<Vec<_>>();
         markets.sort_by_key(|market| market.start_time);
         Ok(markets)
     }
@@ -44,22 +60,29 @@ impl PolymarketUsClient {
         let mut result = Vec::new();
         let limit = 100;
         for page in 0..20 {
-            self.throttle().await;
             let url = format!(
                 "{}{}?limit={limit}&offset={}",
                 self.base_url,
                 sport.discovery_path(),
                 page * limit
             );
-            let response = self.client.get(url).send().await?.error_for_status()?;
-            let payload: EventsResponse = response.json().await?;
+            let payload: EventsResponse = {
+                let _permit = self.permits.acquire().await.expect("semaphore open");
+                self.client
+                    .get(url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?
+            };
             let count = payload.events.len();
             for event in payload.events {
                 let event_id = event.id.clone();
                 match normalize_event(sport, event) {
                     Ok(markets) => result.extend(markets),
                     Err(error) => {
-                        tracing::warn!(%sport, %event_id, %error, "event normalization failed");
+                        tracing::debug!(%sport, %event_id, %error, "event normalization failed");
                     }
                 }
             }
@@ -71,9 +94,9 @@ impl PolymarketUsClient {
     }
 
     pub async fn fetch_book(&self, market_slug: &str) -> Result<MarketBook> {
-        self.throttle().await;
         let slug = url::form_urlencoded::byte_serialize(market_slug.as_bytes()).collect::<String>();
         let url = format!("{}/v1/markets/{slug}/book", self.base_url);
+        let _permit = self.permits.acquire().await.expect("semaphore open");
         let payload: BookResponse = self
             .client
             .get(url)
@@ -85,16 +108,17 @@ impl PolymarketUsClient {
         normalize_book(payload.market_data)
     }
 
-    async fn throttle(&self) {
-        let mut last = self.last_request.lock().await;
-        if let Some(previous) = *last {
-            let elapsed = previous.elapsed();
-            let interval = Duration::from_millis(110);
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
-            }
-        }
-        *last = Some(tokio::time::Instant::now());
+    /// Fetch many books concurrently, bounded by the client's permit count.
+    /// Results keep input order; individual failures do not fail the batch.
+    pub async fn fetch_books(&self, slugs: &[&str]) -> Vec<Result<MarketBook>> {
+        let requests = slugs
+            .iter()
+            .map(|slug| self.fetch_book(slug))
+            .collect::<Vec<_>>();
+        stream::iter(requests)
+            .buffered(self.concurrency * 2)
+            .collect()
+            .await
     }
 }
 
@@ -117,6 +141,7 @@ fn normalize_book(data: RawMarketData) -> Result<MarketBook> {
         offers,
         state: data.state,
         transact_time: parse_datetime(&data.transact_time, "book transactTime")?,
+        fetched_at: Utc::now(),
     })
 }
 
@@ -221,26 +246,35 @@ fn normalize_participant(side: &RawMarketSide) -> Result<MarketParticipant> {
             provider_ids.insert(provider.provider.clone(), provider.provider_id.clone());
         }
     }
+    // `description` is a display nickname ("Ravens", "+17.50"); the team record
+    // carries the canonical full name every external source uses.
+    let name = side
+        .team
+        .as_ref()
+        .map(|team| team.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| side.description.clone())
+        .ok_or_else(|| Error::InvalidData(format!("market side {} has no name", side.id)))?;
     Ok(MarketParticipant {
         side_id: side.id.clone(),
-        name: side
-            .description
-            .clone()
-            .or_else(|| side.team.as_ref().map(|team| team.name.clone()))
-            .ok_or_else(|| Error::InvalidData(format!("market side {} has no name", side.id)))?,
+        name,
         long: side.long,
         team_id: side.team_id,
         provider_ids,
     })
 }
 
+/// Recognized settlement profiles. Anything else is excluded because the
+/// contract would not match the sportsbook moneyline it is compared with.
 fn settlement_rules_supported(sport: Sport, description: &str) -> bool {
     let normalized = description.to_lowercase();
     match sport {
         Sport::Nfl => normalized.contains("tie") && normalized.contains("$0.50"),
+        // Polymarket US voids (fair market price) a match that never starts and
+        // awards a retirement to the opponent; books grade the same way.
         Sport::Tennis => {
-            normalized.contains("$0.50")
-                && (normalized.contains("walkover") || normalized.contains("withdrawal"))
+            (normalized.contains("walkover") || normalized.contains("withdrawal"))
+                && (normalized.contains("$0.50") || normalized.contains("fair market price"))
         }
         Sport::Nba | Sport::Wnba | Sport::Mlb => !description.trim().is_empty(),
     }

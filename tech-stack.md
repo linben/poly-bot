@@ -18,6 +18,32 @@ AWS SDK crates are feature-gated behind the `aws` Cargo feature. Browser
 collection support is feature-gated behind `browser`; it is not enabled for
 unapproved sportsbook automation.
 
+## Run Modes
+
+`config::RunMode` (`RUN_MODE=local|cloud`) is read once and threaded through
+`storage::store_for`, so every binary opens the right store:
+
+| Binary | local | cloud |
+| --- | --- | --- |
+| `local` | scan loop + news loop + retention + dashboard in one Tokio runtime | n/a |
+| `scanner` | one-shot or `--continuous` against the file store | one-shot ECS task against S3/DynamoDB/SQS |
+| `api` | axum on `LISTEN_ADDRESS` | Lambda behind API Gateway |
+| `news-worker` | n/a (the `local` news loop drains `news-queue.ndjson`) | SQS-triggered Lambda |
+| `paper`, `source-probe` | file store | AWS store |
+
+`news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Brave +
+deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
+`DisabledReviewer`. `Store::take_news_queue` and `Store::prune` are the two
+local-only operations; the AWS store's defaults are no-ops because SQS and S3
+lifecycle rules own those concerns.
+
+Local performance choices, all measured against live endpoints: Polymarket
+discovery runs the five sports concurrently with gzip and is cached for
+`DISCOVERY_REFRESH_SECONDS`; books are fetched through a semaphore
+(`POLYMARKET_CONCURRENCY`) instead of a serial throttle; each odds adapter
+collects its sports concurrently. Steady-state scans complete in roughly half
+a second.
+
 ## AWS Architecture
 
 ### ECS Fargate
@@ -30,9 +56,11 @@ The task:
 
 1. Acquires a DynamoDB lease.
 2. Discovers supported Polymarket US events.
-3. Collects ten configured source families concurrently.
+3. Collects the continuous source families concurrently (ESPN, Kalshi,
+   Polymarket global, and any approved direct adapters).
 4. Builds preliminary consensus and opportunities.
-5. Refetches three relevant confirmation sources.
+5. When a candidate survives, refetches up to three contributing continuous
+   sources plus every confirmation-tier source for the candidate sports.
 6. Fetches current Polymarket books and performs depth-aware sizing.
 7. Writes scans and recommendations.
 8. Queues news candidates.
@@ -99,8 +127,8 @@ IDs and a one-hour evidence cache prevent duplicate five-minute search calls.
 ### Secrets Manager
 
 The application secret stores the Brave Search key. The news Lambda reads it
-at runtime. Optional quota-limited validation API keys are not required for the
-scheduled scanner.
+at runtime. The Odds API key, when used, is supplied to the scanner task as
+`THE_ODDS_API_KEY`.
 
 ## External APIs
 
@@ -122,28 +150,36 @@ The US book has one YES instrument:
 - Opposing-outcome execution consumes YES bids at a side cost of
   `1 - YES bid`.
 
-### Sportsbook Adapters
+### Odds Adapters
 
-`config/sources.json` defines primary and fallback source families. Each
-approved adapter is supplied by a `SOURCE_<BOOK>_URL` environment variable and
-must emit the canonical JSON contract documented in `README.md`.
+Every adapter implements `OddsSource` in `src/sources/` and emits
+`SourceQuote` values scoped to the requested sports. Three tiers exist:
 
-Direct adapters must preserve:
+| Tier | Adapters | Role |
+| --- | --- | --- |
+| Continuous | `EspnOddsSource`, `KalshiSource`, `PolymarketGlobalSource`, `CanonicalJsonSource` | Collected every scan for all sports; feed the preliminary consensus |
+| Confirmation | `TheOddsApiSource` | Collected only for sports with a live candidate; bookmaker keys map onto owning families; stops at a credit floor |
+| Validation | none built in | `validation_only` quotes never enter consensus |
+
+Public sources use one shared `reqwest` client with an identifying user agent
+that carries a contact URL (`sources::USER_AGENT`); ESPN rejects bare
+`name/version` agents.
+
+Direct adapters (`SOURCE_<BOOK>_URL`, canonical JSON in `README.md`) must
+preserve:
 
 - Source event and participant identifiers
 - Provider IDs when available
 - Decimal moneyline odds
 - Neutral outcome odds when applicable
-- Event start time
+- Event start time and, if only a date is known, a start-time tolerance
 - Source quote timestamp
 - Fetch timestamp
 - Parser version
 
-The scanner requires ten configured, independent, non-validator families,
-including a reference book. It fails startup otherwise.
-
-The Odds API integration is validation-only and opt-in. Its records cannot
-enter consensus.
+The scanner requires `MINIMUM_CONFIGURED_SOURCES` (default 3) distinct
+continuous families at startup and fails otherwise. A reference book and the
+five-family quorum are enforced per opportunity at runtime.
 
 ### Brave Search and Bedrock
 
@@ -166,16 +202,20 @@ older than two hours cannot preserve an actionable classification.
 
 ### Matching
 
-- Match sport and start time within 15 minutes.
+- Match sport and start time within 15 minutes, or within the quote's own
+  tolerance when the source publishes only a date (Kalshi NFL/NBA).
 - Prefer shared provider IDs.
 - Reject comparable conflicting provider IDs.
-- Fall back only to exact normalized two-participant names.
+- Fall back to normalized two-participant names using the market's canonical
+  `team.name`; accept a city or short-form prefix only when both participants
+  resolve to distinct sides.
 - Preserve tennis doubles separators.
 
 ### Consensus
 
-- Reject stale, future-dated, and validation-only quotes.
-- Keep the newest quote per source family.
+- Reject quotes not observed within the freshness window (`fetched_at`),
+  future-dated quotes, and validation-only quotes.
+- Keep the most recently observed quote per source family.
 - Remove vig proportionally, including neutral settlement outcomes.
 - Use median fair probability and median absolute deviation.
 - Remove outliers beyond the configured robust limit.

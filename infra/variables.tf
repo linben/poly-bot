@@ -47,6 +47,12 @@ variable "source_endpoints" {
   default     = {}
 }
 
+variable "enable_the_odds_api" {
+  description = "Query The Odds API as the confirmation tier; requires the_odds_api_key in the application secret."
+  type        = bool
+  default     = false
+}
+
 variable "cognito_domain_prefix" {
   type    = string
   default = "polybot-research"
