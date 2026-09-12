@@ -7,9 +7,10 @@ use crate::{Error, Result};
 /// Where state lives and which event-driven services run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
-    /// Single host: file-backed store, in-process news loop and dashboard.
+    /// Single host: file-backed store, in-process news loop and terminal UI.
     Local,
-    /// AWS: S3/DynamoDB/SQS store, Lambda news worker and API.
+    /// AWS: S3/DynamoDB/SQS store and the Lambda news worker; the terminal UI
+    /// attaches from the operator's machine.
     Cloud,
 }
 

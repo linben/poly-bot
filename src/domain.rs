@@ -278,6 +278,8 @@ pub struct Opportunity {
     pub source_count: usize,
     pub family_count: usize,
     pub source_ids: Vec<String>,
+    /// Scheduled start of the underlying game or match.
+    pub start_time: DateTime<Utc>,
     pub book_time: DateTime<Utc>,
     pub reasons: Vec<String>,
 }
@@ -434,4 +436,37 @@ pub struct ScanSnapshot {
     pub quote_count: usize,
     pub opportunities: Vec<Opportunity>,
     pub source_health: Vec<SourceHealth>,
+}
+
+/// Everything about a scan except its opportunity rows; small enough for a
+/// single DynamoDB item and cheap for a UI to poll.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanSummary {
+    pub scan_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub market_count: usize,
+    pub quote_count: usize,
+    pub evaluated_count: usize,
+    pub candidate_count: usize,
+    pub source_health: Vec<SourceHealth>,
+}
+
+impl ScanSnapshot {
+    pub fn summary(&self) -> ScanSummary {
+        ScanSummary {
+            scan_id: self.scan_id,
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            market_count: self.market_count,
+            quote_count: self.quote_count,
+            evaluated_count: self.opportunities.len(),
+            candidate_count: self
+                .opportunities
+                .iter()
+                .filter(|item| item.class != RecommendationClass::Rejected)
+                .count(),
+            source_health: self.source_health.clone(),
+        }
+    }
 }

@@ -5,6 +5,11 @@
 //!   (default `https://gamma-api.polymarket.com`).
 //! - `POLYMARKET_GLOBAL_MIN_LIQUIDITY` is the minimum `liquidityNum` in USD a
 //!   market needs before its price is trusted (Decimal, default `2000`).
+//! - `POLYMARKET_GLOBAL_MIN_VOLUME` is the minimum traded `volumeNum` in USD
+//!   (Decimal, default `250`). A freshly listed market carries market-maker
+//!   liquidity seeded near 50/50 before anyone has traded it; observed live on
+//!   ITF tennis at 0.45/0.46 while the US book sat at 0.93. Volume is the
+//!   signal that the price has been tested.
 
 use std::{collections::BTreeMap, env, time::Duration};
 
@@ -29,26 +34,41 @@ const MAX_PAGES: usize = 5;
 /// Widest bid/ask spread (in price units) still considered a real two-sided market.
 const MAX_SPREAD: Decimal = Decimal::from_parts(4, 0, 0, false, 2);
 const DEFAULT_MIN_LIQUIDITY: Decimal = Decimal::from_parts(2000, 0, 0, false, 0);
+const DEFAULT_MIN_VOLUME: Decimal = Decimal::from_parts(250, 0, 0, false, 0);
+
+/// Floors a Gamma market must clear before its price enters consensus.
+#[derive(Debug, Clone, Copy)]
+pub struct MarketFloors {
+    pub min_liquidity: Decimal,
+    pub min_volume: Decimal,
+}
+
+impl Default for MarketFloors {
+    fn default() -> Self {
+        Self {
+            min_liquidity: DEFAULT_MIN_LIQUIDITY,
+            min_volume: DEFAULT_MIN_VOLUME,
+        }
+    }
+}
 
 pub struct PolymarketGlobalSource {
     base_url: String,
-    min_liquidity: Decimal,
+    floors: MarketFloors,
     client: reqwest::Client,
 }
 
 impl PolymarketGlobalSource {
     pub fn new(timeout: Duration) -> Result<Self> {
-        let min_liquidity = match env::var("POLYMARKET_GLOBAL_MIN_LIQUIDITY") {
-            Ok(raw) => Decimal::from_str_exact(raw.trim()).map_err(|error| {
-                Error::Config(format!("POLYMARKET_GLOBAL_MIN_LIQUIDITY {raw:?}: {error}"))
-            })?,
-            Err(_) => DEFAULT_MIN_LIQUIDITY,
+        let floors = MarketFloors {
+            min_liquidity: decimal_env("POLYMARKET_GLOBAL_MIN_LIQUIDITY", DEFAULT_MIN_LIQUIDITY)?,
+            min_volume: decimal_env("POLYMARKET_GLOBAL_MIN_VOLUME", DEFAULT_MIN_VOLUME)?,
         };
         Ok(Self {
             base_url: env::var("POLYMARKET_GAMMA_BASE_URL")
                 .map(|url| url.trim_end_matches('/').to_owned())
                 .unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
-            min_liquidity,
+            floors,
             client: http_client(timeout)?,
         })
     }
@@ -77,6 +97,14 @@ impl PolymarketGlobalSource {
     }
 }
 
+fn decimal_env(name: &str, default: Decimal) -> Result<Decimal> {
+    match env::var(name) {
+        Ok(raw) => Decimal::from_str_exact(raw.trim())
+            .map_err(|error| Error::Config(format!("{name} {raw:?}: {error}"))),
+        Err(_) => Ok(default),
+    }
+}
+
 fn tag_slug(sport: Sport) -> &'static str {
     match sport {
         Sport::Nfl => "nfl",
@@ -97,13 +125,9 @@ impl PolymarketGlobalSource {
             let fetched_at = Utc::now();
             for event in events {
                 for market in &event.markets {
-                    if let Some(quote) = normalize_market(
-                        sport,
-                        &event.teams,
-                        market,
-                        self.min_liquidity,
-                        fetched_at,
-                    ) {
+                    if let Some(quote) =
+                        normalize_market(sport, &event.teams, market, self.floors, fetched_at)
+                    {
                         quotes.push(quote);
                     }
                 }
@@ -144,7 +168,7 @@ fn normalize_market(
     sport: Sport,
     teams: &[GammaTeam],
     market: &GammaMarket,
-    min_liquidity: Decimal,
+    floors: MarketFloors,
     fetched_at: DateTime<Utc>,
 ) -> Option<SourceQuote> {
     if market.sports_market_type.as_deref() != Some("moneyline")
@@ -158,7 +182,8 @@ fn normalize_market(
         return None;
     };
     let liquidity = Decimal::from_f64_retain(market.liquidity_num.unwrap_or(0.0))?;
-    if liquidity < min_liquidity {
+    let volume = Decimal::from_f64_retain(market.volume_num.unwrap_or(0.0))?;
+    if liquidity < floors.min_liquidity || volume < floors.min_volume {
         return None;
     }
     let bid = Decimal::from_f64_retain(bid)?.round_dp(4);
@@ -342,6 +367,8 @@ struct GammaMarket {
     #[serde(default)]
     liquidity_num: Option<f64>,
     #[serde(default)]
+    volume_num: Option<f64>,
+    #[serde(default)]
     accepting_orders: bool,
     #[serde(default)]
     active: bool,
@@ -373,6 +400,7 @@ mod tests {
                 "bestBid": 0.42,
                 "bestAsk": 0.43,
                 "liquidityNum": 118054.37,
+                "volumeNum": 41000.5,
                 "acceptingOrders": true,
                 "active": true,
                 "closed": false,
@@ -402,6 +430,22 @@ mod tests {
                 "bestBid": 0.42,
                 "bestAsk": 0.43,
                 "liquidityNum": 1999.99,
+                "volumeNum": 900,
+                "acceptingOrders": true,
+                "active": true,
+                "closed": false,
+                "updatedAt": "2026-09-12T17:36:51.772231Z"
+            },
+            {
+                "id": "608543",
+                "question": "Seeded, never traded",
+                "sportsMarketType": "moneyline",
+                "gameStartTime": "2026-09-22 17:05:00+00",
+                "outcomes": "[\"Tampa Bay Rays\", \"New York Yankees\"]",
+                "bestBid": 0.45,
+                "bestAsk": 0.46,
+                "liquidityNum": 2538.47,
+                "volumeNum": 85,
                 "acceptingOrders": true,
                 "active": true,
                 "closed": false,
@@ -421,7 +465,7 @@ mod tests {
                     Sport::Mlb,
                     &event.teams,
                     market,
-                    DEFAULT_MIN_LIQUIDITY,
+                    MarketFloors::default(),
                     fetched_at,
                 )
             })

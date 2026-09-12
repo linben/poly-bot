@@ -32,7 +32,7 @@ For each supported pregame moneyline, Polybot should answer:
 5. Is recent news consistent with the opportunity?
 6. Can the position fit inside the paper portfolio limits?
 
-The output is an operational dashboard with actionable, watchlist, and
+The output is an operational terminal dashboard with actionable, watchlist, and
 rejected candidates. Every classification includes enough source, price,
 timing, and news context to audit the decision.
 
@@ -86,7 +86,7 @@ and news citations are retained so a recommendation can be reconstructed.
 - Multi-level YES and opposing-outcome execution pricing
 - Brave Search and Bedrock news review
 - Explicit paper position open and close workflow
-- Authenticated single-user AWS dashboard
+- Terminal UI over the local or cloud store
 
 ## Non-Goals
 
