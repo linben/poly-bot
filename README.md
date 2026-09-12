@@ -3,8 +3,9 @@
 Rust research and paper-risk tooling for pregame sports markets on the
 Polymarket US API. It scans NFL, NBA, WNBA, MLB, and tennis moneylines, compares
 the executable US order book with a de-vigged consensus built from free public
-odds sources (ESPN/DraftKings, Kalshi, Polymarket global) and an optional
-quota-limited multi-book confirmation feed, and enriches candidates with recent
+odds sources (Pinnacle, Action Network's book lines, ESPN/DraftKings, Kalshi,
+Polymarket global, Smarkets) and an optional quota-limited confirmation feed,
+and enriches candidates with recent
 Brave Search evidence summarized by AWS Bedrock.
 
 This repository does not contain wallet credentials, exchange authentication,
@@ -168,23 +169,33 @@ preserve or downgrade a candidate.
 
 ## Odds Sources
 
-Three continuous sources run every scan. They are public, unauthenticated, and
-unmetered, and each is one independent family:
+Six continuous sources run every scan. They are public, unauthenticated, and
+unmetered; each is disabled with `ENABLE_<NAME>=false`:
 
-| Source | Family | Sports | Notes |
+| Source | Families | Sports | Notes |
 | --- | --- | --- | --- |
+| Pinnacle guest API | `pinnacle` (reference) | NFL, NBA, WNBA, MLB, tennis | The logged-out feed behind pinnacle.com; period-0 moneylines joined to pregame matchups; props, alternates and live matchups dropped. Makes the actionable quorum reachable |
+| Action Network scoreboard | `draft_kings`, `fan_duel`, `bet_mgm`, `caesars`, `bet365`, `kambi`, `fanatics`, ... | NFL, NBA, WNBA, MLB | One call per league returns each book's line with its own `inserted` timestamp; lines older than 48 h are dropped as stale openers. The API's book set varies call to call, so coverage per book fluctuates |
 | ESPN core odds | `draft_kings` (per provider ESPN serves) | NFL, NBA, WNBA, MLB | Current-week scoreboard only; American odds converted to decimal |
 | Kalshi public market API | `kalshi` | NFL, NBA, WNBA, MLB | `1 / yes ask` per side; skipped when spread > 6c; NFL/NBA rules carry only a date, so the quote uses a 14-hour start tolerance |
 | Polymarket global Gamma | `polymarket_global` | NFL, NBA, WNBA, MLB, tennis | `1 / ask` and `1 / (1 - bid)`; liquidity floor `POLYMARKET_GLOBAL_MIN_LIQUIDITY`, traded-volume floor `POLYMARKET_GLOBAL_MIN_VOLUME` (seeded, never-traded books sit at 50/50), spread <= 4c |
+| Smarkets exchange | `smarkets` | NFL, MLB, tennis (NBA/WNBA when listed) | Best offer per contract (`10000 / price`); markets with a > 10 pp spread, thin size or one empty side skipped. Quotes endpoint is limited to 20 requests/min, which one scan uses ~5 of |
 
-Three families reach the watchlist quorum, never the actionable one. The Odds
-API (`ENABLE_THE_ODDS_API=true` plus `THE_ODDS_API_KEY`) is the confirmation
-tier: it is only queried for sports that already have a candidate, one
-request per sport returns every US and EU book (Pinnacle, BetOnline, FanDuel,
-BetMGM, Caesars, ...), each mapped onto its owning family so skins are counted
-once, and it stops spending below `THE_ODDS_API_MIN_REMAINING` credits. On the
-free plan (500 credits/month, `us,eu` = 2 credits per sport) that is roughly
-four confirmations a day, which is plenty because candidates are rare.
+Skins of one operator collapse onto one family (DraftKings via ESPN and via
+Action Network is one vote), and the newest quote per family wins. With
+Pinnacle in the consensus a full-quorum side (five families plus the
+reference) is `actionable` when it clears the edge gates; measured on
+2026-09-12, 40 of 148 evaluated sides had 5-8 families.
+
+Probed and rejected from this host (US datacenter IP, no keys): DraftKings,
+Caesars, BetMGM and Circa direct APIs return 403; Bovada returns an empty
+body; BetOnline times out; Kambi's public CDN needs a customer key; FanDuel's
+content API works but adds nothing Action Network does not already carry;
+Novig has no public API. The Odds API (`ENABLE_THE_ODDS_API=true` plus
+`THE_ODDS_API_KEY`) remains available as a confirmation tier: it is only
+queried for sports that already have a candidate, one request per sport
+returns every US and EU book mapped onto its owning family, and it stops
+spending below `THE_ODDS_API_MIN_REMAINING` credits.
 
 `config/sources.json` still defines the direct book catalog. Set
 `SOURCE_<BOOK>_URL` to an approved adapter emitting the canonical JSON below
@@ -275,11 +286,11 @@ cargo run --bin paper -- close <opportunity-uuid>
 ```
 
 `cargo run --bin scanner` performs one scan and exits (the cloud task shape;
-`--continuous` loops). All binaries start with the three built-in public
-sources and fail at startup with fewer than three distinct continuous
-families (`MINIMUM_CONFIGURED_SOURCES`). Without a confirmation-tier source or
-a reference book they log a warning: results can reach the watchlist but never
-become actionable.
+`--continuous` loops). All binaries start with the six built-in public
+sources and fail at startup with fewer than `MINIMUM_CONFIGURED_SOURCES`
+distinct continuous families. Without a reference book (Pinnacle disabled and
+no confirmation tier) they log a warning: results can reach the watchlist but
+never become actionable.
 
 `source-probe` runs a real collection through every configured adapter and
 reports quote counts and latency; with `--adapters-only` it skips the catalog

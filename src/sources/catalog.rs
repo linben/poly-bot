@@ -6,8 +6,8 @@ use crate::{
     Error, Result,
     domain::SourceFamily,
     sources::{
-        CanonicalJsonSource, EspnOddsSource, KalshiSource, PolymarketGlobalSource, SharedSource,
-        TheOddsApiSource,
+        ActionNetworkSource, CanonicalJsonSource, EspnOddsSource, KalshiSource, PinnacleSource,
+        PolymarketGlobalSource, SharedSource, SmarketsSource, TheOddsApiSource,
     },
 };
 
@@ -74,6 +74,12 @@ impl SourceCatalog {
             )?));
         }
 
+        if flag_enabled("ENABLE_PINNACLE", true) {
+            sources.push(Arc::new(PinnacleSource::new(timeout)?));
+        }
+        if flag_enabled("ENABLE_ACTION_NETWORK", true) {
+            sources.push(Arc::new(ActionNetworkSource::new(timeout)?));
+        }
         if flag_enabled("ENABLE_ESPN_ODDS", true) {
             sources.push(Arc::new(EspnOddsSource::new(timeout)?));
         }
@@ -82,6 +88,9 @@ impl SourceCatalog {
         }
         if flag_enabled("ENABLE_POLYMARKET_GLOBAL", true) {
             sources.push(Arc::new(PolymarketGlobalSource::new(timeout)?));
+        }
+        if flag_enabled("ENABLE_SMARKETS", true) {
+            sources.push(Arc::new(SmarketsSource::new(timeout)?));
         }
         if flag_enabled("ENABLE_THE_ODDS_API", false)
             && let Ok(api_key) = env::var("THE_ODDS_API_KEY")

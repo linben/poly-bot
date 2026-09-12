@@ -61,7 +61,7 @@ impl Scanner {
             .collect::<Vec<_>>();
         let families = continuous
             .iter()
-            .map(|source| source.family())
+            .flat_map(|source| source.families())
             .collect::<HashSet<_>>();
         if families.len() < settings.minimum_configured_sources {
             return Err(crate::Error::Config(format!(
@@ -74,7 +74,7 @@ impl Scanner {
         let has_confirmation = sources.iter().any(|source| source.confirmation_only());
         if !has_confirmation && !families.iter().any(|family| family.is_reference()) {
             warn!(
-                "no reference book and no confirmation-tier source configured; results cannot exceed watchlist (set ENABLE_THE_ODDS_API=true and THE_ODDS_API_KEY)"
+                "no reference book configured; results cannot exceed watchlist (enable Pinnacle, or set ENABLE_THE_ODDS_API=true and THE_ODDS_API_KEY)"
             );
         }
         info!(

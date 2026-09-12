@@ -68,8 +68,9 @@ The task:
 
 1. Acquires a DynamoDB lease.
 2. Discovers supported Polymarket US events.
-3. Collects the continuous source families concurrently (ESPN, Kalshi,
-   Polymarket global, and any approved direct adapters).
+3. Collects the continuous source families concurrently (Pinnacle, Action
+   Network book lines, ESPN, Kalshi, Polymarket global, Smarkets, and any
+   approved direct adapters).
 4. Builds preliminary consensus and opportunities.
 5. When a candidate survives, refetches up to three contributing continuous
    sources plus every confirmation-tier source for the candidate sports.
@@ -158,7 +159,7 @@ Every adapter implements `OddsSource` in `src/sources/` and emits
 
 | Tier | Adapters | Role |
 | --- | --- | --- |
-| Continuous | `EspnOddsSource`, `KalshiSource`, `PolymarketGlobalSource`, `CanonicalJsonSource` | Collected every scan for all sports; feed the preliminary consensus |
+| Continuous | `PinnacleSource` (reference), `ActionNetworkSource` (multi-book; `families()` lists every family it maps), `EspnOddsSource`, `KalshiSource`, `PolymarketGlobalSource`, `SmarketsSource`, `CanonicalJsonSource` | Collected every scan for all sports; feed the preliminary consensus |
 | Confirmation | `TheOddsApiSource` | Collected only for sports with a live candidate; bookmaker keys map onto owning families; stops at a credit floor |
 | Validation | none built in | `validation_only` quotes never enter consensus |
 
