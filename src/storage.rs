@@ -108,6 +108,25 @@ impl LocalStore {
     }
 }
 
+/// Read and decode one JSON file; `None` when it does not exist. A decode
+/// failure names the file so an operator can tell a schema change (delete the
+/// file, or let the next scan rewrite `latest-*.json`) from a corrupt store.
+async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let content = match tokio::fs::read(path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::Storage(format!("read {}: {error}", path.display())));
+        }
+    };
+    serde_json::from_slice(&content).map(Some).map_err(|error| {
+        Error::Storage(format!(
+            "decode {}: {error} (schema change? delete the file or let the next scan rewrite it)",
+            path.display()
+        ))
+    })
+}
+
 #[async_trait]
 impl Store for LocalStore {
     async fn acquire_scan_lease(&self, lease_id: Uuid, ttl: Duration) -> Result<bool> {
@@ -175,14 +194,10 @@ impl Store for LocalStore {
     }
 
     async fn load_portfolio(&self, bankroll: Decimal) -> Result<PaperPortfolio> {
-        let path = self.root.join("portfolio.json");
-        if !path.exists() {
-            return Ok(empty_portfolio(bankroll));
+        match read_json(&self.root.join("portfolio.json")).await? {
+            Some(portfolio) => normalize_portfolio(portfolio, bankroll),
+            None => Ok(empty_portfolio(bankroll)),
         }
-        let content = fs::read(&path)
-            .map_err(|error| Error::Storage(format!("read {}: {error}", path.display())))?;
-        let portfolio = serde_json::from_slice(&content)?;
-        normalize_portfolio(portfolio, bankroll)
     }
 
     async fn save_portfolio(&self, portfolio: &PaperPortfolio) -> Result<()> {
@@ -223,35 +238,22 @@ impl Store for LocalStore {
     }
 
     async fn latest_scan(&self) -> Result<Option<ScanSummary>> {
-        let path = self.root.join("latest-scan.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = fs::read(&path)
-            .map_err(|error| Error::Storage(format!("read {}: {error}", path.display())))?;
-        Ok(Some(serde_json::from_slice(&content)?))
+        read_json(&self.root.join("latest-scan.json")).await
     }
     async fn latest_opportunities(&self) -> Result<Vec<Opportunity>> {
-        let path = self.root.join("latest-opportunities.json");
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = fs::read(path)
-            .map_err(|error| Error::Storage(format!("read opportunities: {error}")))?;
-        Ok(serde_json::from_slice(&content)?)
+        Ok(read_json(&self.root.join("latest-opportunities.json"))
+            .await?
+            .unwrap_or_default())
     }
 
     async fn news_for(&self, opportunity_id: Uuid) -> Result<Option<NewsEvidence>> {
-        let path = self
-            .root
-            .join("news")
-            .join(format!("{opportunity_id}.json"));
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = fs::read(&path)
-            .map_err(|error| Error::Storage(format!("read {}: {error}", path.display())))?;
-        Ok(Some(serde_json::from_slice(&content)?))
+        read_json(
+            &self
+                .root
+                .join("news")
+                .join(format!("{opportunity_id}.json")),
+        )
+        .await
     }
 
     async fn enqueue_news(&self, opportunities: &[Opportunity]) -> Result<()> {
