@@ -21,7 +21,7 @@ architecture and technology choices are documented in
 - Contract acquisition price: `$0.35` through `$0.65`
 - Paper bankroll: `$100`
 - Position risk: quarter Kelly, bounded to 1-5% of bankroll (floor configurable)
-- Watchlist: at least three independent source families (configurable, >= 2)
+- Watchlist: at least three independent source families (configurable, >= 1)
 - Actionable consensus: at least five independent families, including a
   reference book (both configurable)
 - Edge: at least five percentage points raw and three percentage points after
@@ -72,7 +72,7 @@ make tui                        # attach a viewer to data/ (or RUN_MODE=cloud)
 
 Every gate is an environment variable (see `.env.example`): `MINIMUM_RAW_EDGE`,
 `MINIMUM_NET_EDGE`, `MINIMUM_PRICE`/`MAXIMUM_PRICE`,
-`WATCHLIST_SOURCE_FAMILIES` (>= 2), `MINIMUM_SOURCE_FAMILIES` (>= watchlist),
+`WATCHLIST_SOURCE_FAMILIES` (>= 1; a single family is one venue, not consensus), `MINIMUM_SOURCE_FAMILIES` (>= watchlist),
 `REQUIRE_REFERENCE_BOOK`, `MINIMUM_POSITION_FRACTION` (0 disables the size
 floor). The System view shows the values in force. `make local-explore` runs the
 loosest combination validation permits into `data-explore/`, so a quiet market

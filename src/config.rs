@@ -163,12 +163,12 @@ impl Settings {
                 "scan timing, request timeout, and concurrency must be positive".into(),
             ));
         }
-        if self.watchlist_source_families < 2
+        if self.watchlist_source_families < 1
             || self.minimum_source_families < self.watchlist_source_families
             || self.minimum_configured_sources < self.watchlist_source_families
         {
             return Err(Error::Config(
-                "source-family quorum must be at least 2 watchlist, actionable at least watchlist, with at least that many configured continuous families".into(),
+                "source-family quorum must be at least 1 watchlist, actionable at least watchlist, with at least that many configured continuous families".into(),
             ));
         }
         if self.minimum_price <= Decimal::ZERO

@@ -23,8 +23,8 @@ local-once:
 # with the default policy; use a separate data dir.
 local-explore:
 	MINIMUM_RAW_EDGE=0.01 MINIMUM_NET_EDGE=0 MINIMUM_POSITION_FRACTION=0 \
-	MINIMUM_PRICE=0.10 MAXIMUM_PRICE=0.90 WATCHLIST_SOURCE_FAMILIES=2 \
-	MINIMUM_SOURCE_FAMILIES=3 REQUIRE_REFERENCE_BOOK=false \
+	MINIMUM_PRICE=0.10 MAXIMUM_PRICE=0.90 WATCHLIST_SOURCE_FAMILIES=1 \
+	MINIMUM_SOURCE_FAMILIES=2 REQUIRE_REFERENCE_BOOK=false \
 	cargo run --release --bin local -- --data-dir data-explore
 
 # Cloud one-shot scan (what the ECS task runs).
