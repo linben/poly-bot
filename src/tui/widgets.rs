@@ -21,10 +21,17 @@ pub enum Tone {
 }
 
 impl Tone {
+    /// Mid gray from the 256-colour cube (`#949494`). ANSI `DarkGray` is
+    /// "bright black", which several default dark palettes render within a
+    /// few shades of the background; roughly half of every screen (labels,
+    /// headers, separators, rejected rows) is muted, so it must stay legible
+    /// on both dark and light backgrounds.
+    const MUTED: Color = Color::Indexed(246);
+
     pub fn style(self) -> Style {
         match self {
             Tone::Neutral => Style::default(),
-            Tone::Muted => Style::default().fg(Color::DarkGray),
+            Tone::Muted => Style::default().fg(Self::MUTED),
             Tone::Good => Style::default().fg(Color::Green),
             Tone::Warn => Style::default().fg(Color::Yellow),
             Tone::Bad => Style::default().fg(Color::Red),

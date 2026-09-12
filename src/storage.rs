@@ -108,23 +108,50 @@ impl LocalStore {
     }
 }
 
-/// Read and decode one JSON file; `None` when it does not exist. A decode
-/// failure names the file so an operator can tell a schema change (delete the
-/// file, or let the next scan rewrite `latest-*.json`) from a corrupt store.
-async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    let content = match tokio::fs::read(path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Error::Storage(format!("read {}: {error}", path.display())));
-        }
-    };
-    serde_json::from_slice(&content).map(Some).map_err(|error| {
+/// Read one file; `None` when it does not exist.
+async fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Storage(format!("read {}: {error}", path.display()))),
+    }
+}
+
+/// Decode one JSON record. The error names the file so an operator can tell
+/// a schema change (delete the file, or let the next scan rewrite
+/// `latest-*.json`) from a corrupt store.
+fn decode<T: serde::de::DeserializeOwned>(path: &Path, content: &[u8]) -> Result<T> {
+    serde_json::from_slice(content).map_err(|error| {
         Error::Storage(format!(
             "decode {}: {error} (schema change? delete the file or let the next scan rewrite it)",
             path.display()
         ))
     })
+}
+
+/// State files (`portfolio.json`, news evidence): a decode failure is an error.
+async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    read_bytes(path)
+        .await?
+        .map(|content| decode(path, &content))
+        .transpose()
+}
+
+/// `latest-*.json` are caches of the most recent scan that the next scan
+/// rewrites in full. One written by an older binary (schema change) must not
+/// wedge a viewer or the scan loop: log it and treat it as absent. IO errors
+/// still propagate.
+async fn read_cache<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let Some(content) = read_bytes(path).await? else {
+        return Ok(None);
+    };
+    match decode(path, &content) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            tracing::warn!(%error, "ignoring stale cache until the next scan");
+            Ok(None)
+        }
+    }
 }
 
 #[async_trait]
@@ -238,10 +265,10 @@ impl Store for LocalStore {
     }
 
     async fn latest_scan(&self) -> Result<Option<ScanSummary>> {
-        read_json(&self.root.join("latest-scan.json")).await
+        read_cache(&self.root.join("latest-scan.json")).await
     }
     async fn latest_opportunities(&self) -> Result<Vec<Opportunity>> {
-        Ok(read_json(&self.root.join("latest-opportunities.json"))
+        Ok(read_cache(&self.root.join("latest-opportunities.json"))
             .await?
             .unwrap_or_default())
     }
@@ -696,6 +723,28 @@ mod tests {
         let loaded = store.load_portfolio(Decimal::ONE_HUNDRED).await.unwrap();
         assert_eq!(loaded.open_exposure, Decimal::new(2, 0));
         assert_eq!(loaded.open_positions.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `latest-*.json` written by an older binary must not wedge a viewer;
+    /// `portfolio.json` is state and must fail loudly, naming the file.
+    #[tokio::test]
+    async fn stale_caches_are_ignored_but_state_files_are_strict() {
+        let root = std::env::temp_dir().join(format!("polybot-storage-test-{}", Uuid::new_v4()));
+        let store = LocalStore::new(&root).unwrap();
+        fs::write(root.join("latest-opportunities.json"), br#"[{"id":"x"}]"#).unwrap();
+        fs::write(root.join("latest-scan.json"), br#"{"scan_id":"nope"}"#).unwrap();
+        fs::write(root.join("portfolio.json"), br#"{"bankroll":"100"}"#).unwrap();
+
+        assert!(store.latest_opportunities().await.unwrap().is_empty());
+        assert!(store.latest_scan().await.unwrap().is_none());
+        let error = store
+            .load_portfolio(Decimal::ONE_HUNDRED)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("portfolio.json"), "{error}");
 
         fs::remove_dir_all(root).unwrap();
     }
