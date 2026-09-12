@@ -1,4 +1,4 @@
-.PHONY: check test local local-once run probe paper api terraform-init terraform-check lambda
+.PHONY: check test local local-headless local-once run probe paper tui terraform-init terraform-check lambda
 
 check:
 	cargo fmt --check
@@ -7,9 +7,13 @@ check:
 test:
 	cargo test --all-features
 
-# Local mode: scanner loop + news loop + dashboard in one process.
+# Local mode: scanner loop + news loop + terminal UI in one process.
 local:
 	cargo run --release --bin local
+
+# Local mode without the terminal UI (what the systemd unit runs).
+local-headless:
+	cargo run --release --bin local -- --headless
 
 local-once:
 	cargo run --release --bin local -- --once
@@ -24,8 +28,9 @@ probe:
 paper:
 	cargo run --bin paper -- list
 
-api:
-	cargo run --bin api
+# Attach the terminal UI to the configured store (RUN_MODE=local or cloud).
+tui:
+	cargo run --release --bin tui
 
 terraform-check:
 	terraform -chdir=infra fmt -check
@@ -35,4 +40,4 @@ terraform-init:
 	terraform -chdir=infra init
 
 lambda:
-	cargo lambda build --release --arm64 --features aws --bin api --bin news-worker
+	cargo lambda build --release --arm64 --features aws --bin news-worker

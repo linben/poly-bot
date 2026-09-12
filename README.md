@@ -52,10 +52,10 @@ the same scanner, consensus, sizing, and news logic.
 
 | | `local` (default) | `cloud` |
 | --- | --- | --- |
-| Process | one `local` binary: scan loop, news loop, retention, dashboard | ECS one-shot `scanner`, Lambda `news-worker`, Lambda `api` |
+| Process | one `local` binary: scan loop, news loop, retention, terminal UI | ECS one-shot `scanner`, Lambda `news-worker` |
 | Store | files under `data/` (`scans/`, `latest-opportunities.json`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
 | News reviewer | `keyword` (Brave + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
-| Dashboard | `http://127.0.0.1:8080`, no auth | CloudFront + Cognito |
+| Dashboard | terminal UI in-process, or `tui` attached to `data/` | `tui` with `RUN_MODE=cloud` and AWS credentials |
 | Requires | Rust toolchain, outbound HTTPS | AWS account, Terraform, Docker, cargo-lambda |
 
 ### Local mode
@@ -65,14 +65,18 @@ cp .env.example .env            # optional: add THE_ODDS_API_KEY / BRAVE_SEARCH_
 set -a; source .env; set +a
 make local                      # or: cargo run --release --bin local
 make local-once                 # one scan + one news pass, then exit
+make local-headless             # loops only, no terminal UI
+make tui                        # attach a viewer to data/ (or RUN_MODE=cloud)
 ```
 
 `local` runs a fixed-cadence scan (`SCAN_INTERVAL_SECONDS`, default 300),
 drains the news queue every 20 s, prunes scan snapshots older than
-`LOCAL_RETENTION_DAYS` (default 14), and serves the dashboard on
-`LISTEN_ADDRESS`. A failed scan is logged and retried next tick; only
-configuration errors exit. `deploy/polybot-local.service` is a user systemd
-unit for unattended operation. Logs go to stderr, JSON to stdout.
+`LOCAL_RETENTION_DAYS` (default 14), and, when stdin and stdout are a TTY,
+opens the terminal UI in the same process; `q` quits the UI and stops the
+loops. `--headless` skips the UI, which is what `deploy/polybot-local.service`
+(a user systemd unit for unattended operation) runs. A failed scan is logged
+and retried next tick; only configuration errors exit. Without the UI, logs go
+to stderr and JSON to stdout.
 
 Measured on 2026-09-12 against live APIs (release build): a cold scan takes
 about 3.3 s, of which market discovery is 2.2-2.5 s of Polymarket server time
@@ -85,21 +89,52 @@ work a scan took ~24 s, dominated by a serial 110 ms per-request throttle.
 Started games are dropped at evaluation time so the discovery cache cannot
 leak an in-play book.
 
+### Terminal UI
+
+The UI is the operator surface in both modes. `local` opens it in-process when
+run from a TTY, so it also shows live engine state (scan phase, countdown,
+failures) and the captured log. `tui` is an attach-only viewer over the
+configured store: with `RUN_MODE=local` it reads `data/` (`DATA_DIR`), with
+`RUN_MODE=cloud` it reads DynamoDB and S3 using the operator's AWS
+credentials. There is no hosted web UI.
+
+| View | Shows | Keys |
+| --- | --- | --- |
+| Overview | status line (mode, phase, scan age and duration, counts, next scan); SCAN, SOURCES, EDGE & PAPER panels; CANDIDATES (live candidates first, then closest misses); LOG tail | `o` paper-open the top candidate, `r` rescan now (in-process) or reload (attached) |
+| Markets | every evaluated market side, with a DETAIL pane for the selected row (VWAP, maker price, size, fee, sources, news, every rejection reason) | `↑`/`↓` `j`/`k` `PgUp`/`PgDn` `g`/`G`, `s` sort (net edge / raw edge / families / class / sport), `f` cycle sport filter, `⏎` toggle detail, `o` paper-open selected |
+| Sources | reachability, quotes, latency per source; markets matched per source and sport | `r` rescan |
+| Portfolio | bankroll, exposure gauge, headroom; open paper positions with their current class | `↑`/`↓`, `c` close selected |
+| System | every threshold and cadence in force; scrollable log | `↑`/`↓`, `g`/`G` |
+
+`Tab`/`Shift-Tab` or `1`-`5` switch views; `q` quits (and stops the loops in
+`local`). Paper actions use the same rules as `paper open`/`close`: open
+requires an actionable, news-reviewed row from the latest scan and respects the
+$5 exposure cap.
+
+Design, from reviewing the `vulcan` bot TUI in the sibling repository and the
+ratatui ecosystem: ratatui 0.30 + crossterm 0.29 with the crossterm
+`EventStream`, so keys, store updates, engine status and a 1 s clock are a
+single `tokio::select!` and the screen is redrawn only when one of them fires;
+the store is polled off the render loop (every 2 s for files, 10 s for
+DynamoDB) into an immutable snapshot with precomputed edge statistics; while
+the UI owns the terminal, `tracing` events go to a 500-line in-memory ring
+buffer instead of stderr. One palette (`Tone`) maps semantic state to colour so
+every panel reads the same way: green actionable / reachable / positive edge,
+yellow watchlist / lower / review, red failures and `reject`, grey rejected.
+
 ### Cloud mode
 
 The five-minute scanner runs as a scheduled one-shot ECS Fargate task. It can
 perform concurrent network collection without Lambda's packaging and duration
 constraints. A DynamoDB lease prevents overlapping scheduled tasks.
 
-Lambda is used for the short, event-driven work:
-
-- SQS-triggered Brave Search and Bedrock enrichment
-- Authenticated dashboard API
+Lambda is used only for the short, event-driven news work: SQS-triggered
+Brave Search and Bedrock enrichment.
 
 S3 stores raw scans and quote snapshots. DynamoDB stores current
 recommendations, news evidence, paper portfolio state, and the scanner lease.
-CloudFront serves a private S3 dashboard and routes `/api/*` to API Gateway.
-Cognito uses authorization code flow with PKCE.
+Operators inspect the cloud store with `RUN_MODE=cloud cargo run --features aws
+--bin tui` under their own AWS credentials.
 
 ### News reviewers
 
@@ -127,7 +162,7 @@ unmetered, and each is one independent family:
 | --- | --- | --- | --- |
 | ESPN core odds | `draft_kings` (per provider ESPN serves) | NFL, NBA, WNBA, MLB | Current-week scoreboard only; American odds converted to decimal |
 | Kalshi public market API | `kalshi` | NFL, NBA, WNBA, MLB | `1 / yes ask` per side; skipped when spread > 6c; NFL/NBA rules carry only a date, so the quote uses a 14-hour start tolerance |
-| Polymarket global Gamma | `polymarket_global` | NFL, NBA, WNBA, MLB, tennis | `1 / ask` and `1 / (1 - bid)`; liquidity floor `POLYMARKET_GLOBAL_MIN_LIQUIDITY`, spread <= 4c |
+| Polymarket global Gamma | `polymarket_global` | NFL, NBA, WNBA, MLB, tennis | `1 / ask` and `1 / (1 - bid)`; liquidity floor `POLYMARKET_GLOBAL_MIN_LIQUIDITY`, traded-volume floor `POLYMARKET_GLOBAL_MIN_VOLUME` (seeded, never-traded books sit at 50/50), spread <= 4c |
 
 Three families reach the watchlist quorum, never the actionable one. The Odds
 API (`ENABLE_THE_ODDS_API=true` plus `THE_ODDS_API_KEY`) is the confirmation
@@ -213,8 +248,9 @@ cargo run --bin source-probe -- --adapters-only
 make local-once
 ```
 
-The local dashboard listens on `http://127.0.0.1:8080` by default. Scanner
-output is written under `data/`. The scanner uses persisted `portfolio.json`
+`make tui` attaches the terminal UI to `data/`; `make local` opens it
+in-process. Scanner output is written under `data/`. The scanner uses
+persisted `portfolio.json`
 positions for exposure checks; it does not silently add a
 position before news review. Use the explicit paper commands after reviewing a
 candidate:
@@ -240,10 +276,9 @@ homepage reachability checks. Logs go to stderr, JSON results to stdout.
 
 1. Populate the Terraform variables and create the managed ECR repository.
 2. Build and push the scanner image using the immutable configured tag.
-3. Build the two Rust Lambda archives.
+3. Build the `news-worker` Lambda archive.
 4. Apply the complete Terraform stack.
 5. Put the Brave free-plan key in the generated secret.
-6. Create the first Cognito user.
 
 ```bash
 cp infra/terraform.tfvars.example infra/terraform.tfvars
@@ -256,29 +291,25 @@ aws ecr get-login-password --region us-east-1 | \
 docker build --platform linux/arm64 -t "$REPOSITORY:sha-REPLACE" .
 docker push "$REPOSITORY:sha-REPLACE"
 
-cargo lambda build --release --arm64 --features aws --bin api --bin news-worker
+cargo lambda build --release --arm64 --features aws --bin news-worker
 terraform -chdir=infra apply
 
 aws secretsmanager put-secret-value \
   --secret-id "$(terraform -chdir=infra output -raw application_secret_id)" \
   --secret-string '{"brave_search_api_key":"replace-me","the_odds_api_key":"optional"}'
-
-aws cognito-idp admin-create-user \
-  --user-pool-id "$(terraform -chdir=infra output -raw cognito_user_pool_id)" \
-  --username you@example.com
 ```
 
-The Lambda zip paths default to cargo-lambda's output under `target/lambda/`.
-The image tag in `terraform.tfvars` must match the pushed tag. Use Terraform
-outputs for the dashboard URL, data bucket, user pool, and ECR repository.
+The Lambda zip path defaults to cargo-lambda's output under `target/lambda/`.
+The image tag in `terraform.tfvars` must match the pushed tag. Terraform
+outputs `application_secret_id`, `scanner_repository_url`, and `data_bucket`.
 
 ## Operations
 
 - A scan is rejected when another task owns the unexpired DynamoDB lease.
 - Raw S3 partitions are organized by scan date.
 - SQS retries only failed news records; poison records move to the DLQ.
-- CloudWatch alarms cover API errors, news errors, the news DLQ, and scheduler
-  target errors.
+- CloudWatch alarms cover news errors, the news DLQ, scheduler target errors,
+  and scanner failures.
 - All consensus input preserves source timestamps and parser versions.
 - Provider IDs are preferred for event matching. Comparable conflicting IDs
   are rejected rather than falling back to names.

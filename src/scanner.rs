@@ -94,6 +94,13 @@ impl Scanner {
         &self.settings
     }
 
+    pub fn source_ids(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(|source| source.id().to_string())
+            .collect()
+    }
+
     pub async fn run_once(&self) -> Result<ScanSnapshot> {
         let scan_id = Uuid::new_v4();
         if !self
@@ -442,6 +449,7 @@ mod tests {
             source_count: source_ids.len(),
             family_count: source_ids.len(),
             source_ids: source_ids.iter().map(|id| id.to_string()).collect(),
+            start_time: Utc::now() + chrono::Duration::hours(2),
             book_time: Utc::now(),
             reasons: Vec::new(),
         }

@@ -1,16 +1,17 @@
 pub mod config;
 pub mod consensus;
-pub mod dashboard;
 pub mod domain;
 pub mod error;
 pub mod matching;
 pub mod news;
 pub mod opportunity;
+pub mod paper;
 pub mod polymarket;
 pub mod risk;
 pub mod scanner;
 pub mod sources;
 pub mod storage;
+pub mod tui;
 
 pub use error::{Error, Result};
 

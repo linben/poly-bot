@@ -4,19 +4,31 @@
 
 | Area | Technology | Purpose |
 | --- | --- | --- |
-| Language | Rust 2024 edition, Rust 1.90+ | Scanner, API, source adapters, news worker, paper CLI |
+| Language | Rust 2024 edition, Rust 1.90+ | Scanner, terminal UI, source adapters, news worker, paper CLI |
 | Async runtime | Tokio | Concurrent HTTP collection and service execution |
 | HTTP client | Reqwest with rustls | Polymarket, source adapters, and Brave Search |
-| Local API | Axum | Dashboard and JSON endpoints |
+| Terminal UI | ratatui + crossterm | Operator views over the local or cloud store |
 | Serialization | Serde and serde_json | Upstream normalization and persisted records |
 | Numeric model | rust_decimal | Odds, probabilities, fees, VWAP, and risk without floats |
 | Time and IDs | Chrono and UUID | UTC freshness checks and stable market-side IDs |
 | Observability | tracing | Structured scanner and Lambda logs |
-| CLI | Clap | Scanner, source probe, API, and paper position commands |
+| CLI | Clap | Scanner, source probe, terminal UI, and paper position commands |
 
 AWS SDK crates are feature-gated behind the `aws` Cargo feature. Browser
 collection support is feature-gated behind `browser`; it is not enabled for
 unapproved sportsbook automation.
+
+### Terminal UI
+
+`tui` renders with ratatui on a crossterm backend. The render loop draws on
+change, not on a fixed frame rate: `event::poll` waits up to 100 ms for a key,
+and a frame is redrawn only when the store or engine state changed or the 1 s
+clock ticked (scan age and countdown). The store is polled every 2 s in local
+mode and every 10 s in cloud mode. While the TUI owns the terminal, `tracing`
+output is captured into an in-memory ring buffer that feeds the LOG panels
+instead of being written to stderr. Views: Overview, Markets, Sources,
+Portfolio, System (`Tab` / `1`-`5`); Portfolio's `o`/`c` reuse the `paper
+open`/`close` rules.
 
 ## Run Modes
 
@@ -25,9 +37,9 @@ unapproved sportsbook automation.
 
 | Binary | local | cloud |
 | --- | --- | --- |
-| `local` | scan loop + news loop + retention + dashboard in one Tokio runtime | n/a |
+| `local` | scan loop + news loop + retention in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` for systemd | n/a |
 | `scanner` | one-shot or `--continuous` against the file store | one-shot ECS task against S3/DynamoDB/SQS |
-| `api` | axum on `LISTEN_ADDRESS` | Lambda behind API Gateway |
+| `tui` | attach-only viewer over `data/` | attach-only viewer over DynamoDB/S3 with the operator's AWS credentials |
 | `news-worker` | n/a (the `local` news loop drains `news-queue.ndjson`) | SQS-triggered Lambda |
 | `paper`, `source-probe` | file store | AWS store |
 
@@ -68,26 +80,15 @@ The task:
 
 ### Lambda
 
-Two Rust Lambda functions handle event-driven work:
-
-- `api`: serves health and authenticated opportunity data.
-- `news-worker`: consumes SQS messages, calls Brave Search and Bedrock, and
-  stores cited news evidence.
+One Rust Lambda function, `news-worker`, handles the event-driven work: it
+consumes SQS messages, calls Brave Search and Bedrock, and stores cited news
+evidence.
 
 The news worker returns partial batch failures so one bad record does not
 replay an entire successful SQS batch.
 
-### API and Dashboard
-
-- API Gateway HTTP API routes `/api/opportunities` to the API Lambda.
-- A Cognito JWT authorizer protects opportunity data.
-- Cognito uses authorization code flow with PKCE.
-- A private S3 bucket stores `index.html` and generated `config.js`.
-- CloudFront uses Origin Access Control for S3 and routes `/api/*` to API
-  Gateway.
-
-The local development API serves the same dashboard without authentication on
-`127.0.0.1:8080`.
+There is no hosted UI. Operators run `tui` with `RUN_MODE=cloud` against the
+data services below.
 
 ## Data Services
 
@@ -236,13 +237,12 @@ Terraform under `infra/` provisions:
 - VPC, public subnets, route table, and outbound-only scanner security group
 - ECR repository and lifecycle policy
 - ECS cluster, task definition, IAM, logs, and five-minute schedule
-- S3 data and dashboard buckets
+- S3 data bucket
 - DynamoDB state table
 - SQS news queue and DLQ
 - Secrets Manager secret
-- API and news Lambda functions
-- API Gateway, Cognito, CloudFront, and S3 Origin Access Control
-- CloudWatch alarms for API, news, scanner, scheduler, and DLQ failures
+- News Lambda function
+- CloudWatch alarms for news, scanner, scheduler, and DLQ failures
 
 The scanner image tag is immutable and normally uses a Git commit SHA. Lambda
 archives are built with `cargo-lambda` for `arm64`.
@@ -254,7 +254,7 @@ Primary commands:
 ```bash
 make check
 make test
-make api
+make tui
 make probe
 make terraform-check
 make lambda
@@ -266,7 +266,6 @@ Quality gates include:
 - Clippy across all targets and features with warnings denied
 - Unit and fixture tests across all features
 - Terraform formatting and validation
-- HTTP verification of local dashboard endpoints
 
 Fixtures cover Polymarket event and book payloads, canonical source quotes,
 YES/opposing-outcome conversion, fee rounding, multi-level sizing, matching,

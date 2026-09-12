@@ -104,8 +104,10 @@ impl OpportunityEngine {
         }
         if top_price < self.settings.minimum_price || top_price > self.settings.maximum_price {
             reasons.push(format!(
-                "executable price {top_price} is outside {}-{}",
-                self.settings.minimum_price, self.settings.maximum_price
+                "executable price {} is outside {}-{}",
+                top_price.round_dp(4),
+                self.settings.minimum_price,
+                self.settings.maximum_price
             ));
         }
         if consensus.family_count < self.settings.watchlist_source_families {
@@ -157,8 +159,10 @@ impl OpportunityEngine {
         };
         if executable < self.settings.minimum_price || executable > self.settings.maximum_price {
             reasons.push(format!(
-                "depth-weighted price {executable} is outside {}-{}",
-                self.settings.minimum_price, self.settings.maximum_price
+                "depth-weighted price {} is outside {}-{}",
+                executable.round_dp(4),
+                self.settings.minimum_price,
+                self.settings.maximum_price
             ));
         }
         let fee_per_contract = if sized.quantity > Decimal::ZERO {
@@ -166,8 +170,9 @@ impl OpportunityEngine {
         } else {
             exact_fee_per_contract
         };
-        let raw_edge = fair - executable;
-        let net_edge = conservative - executable - fee_per_contract;
+        // Six places is far below any tick or fee; keeps records legible.
+        let raw_edge = (fair - executable).round_dp(6);
+        let net_edge = (conservative - executable - fee_per_contract).round_dp(6);
         if raw_edge < self.settings.minimum_raw_edge {
             reasons.push(format!(
                 "raw edge {raw_edge} is below {}",
@@ -216,9 +221,9 @@ impl OpportunityEngine {
             market_slug: market.market_slug.clone(),
             participant,
             side,
-            fair_probability: fair,
-            conservative_probability: conservative,
-            executable_price: executable,
+            fair_probability: fair.round_dp(6),
+            conservative_probability: conservative.round_dp(6),
+            executable_price: executable.round_dp(6),
             maker_price,
             raw_edge,
             net_edge,
@@ -228,6 +233,7 @@ impl OpportunityEngine {
             source_count: consensus.source_count,
             family_count: consensus.family_count,
             source_ids: consensus.source_ids.clone(),
+            start_time: market.start_time,
             book_time: book.transact_time,
             reasons,
         }
