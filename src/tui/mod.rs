@@ -576,11 +576,7 @@ mod tests {
             loaded_at: Utc::now(),
             scan: None,
             rows: Vec::new(),
-            portfolio: PaperPortfolio {
-                bankroll: rust_decimal::Decimal::ONE_HUNDRED,
-                open_exposure: rust_decimal::Decimal::ZERO,
-                open_positions: Vec::new(),
-            },
+            portfolio: PaperPortfolio::new(rust_decimal::Decimal::ONE_HUNDRED),
             error: None,
             stats: data::EdgeStats::default(),
         });

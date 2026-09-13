@@ -94,7 +94,11 @@ pub fn size_position_from_levels(
 
     let mut quantity = Decimal::ZERO;
     let mut gross_cost = Decimal::ZERO;
+    // Per-level fees rounded to cents, as the venue charges each fill.
     let mut estimated_fee = Decimal::ZERO;
+    // The venue never collects more across an order's fills than the rounding
+    // of the cumulative exact fee; track it to cap the per-fill sum.
+    let mut exact_fee_total = Decimal::ZERO;
     for level in levels.iter().filter(|level| {
         level.side_price > Decimal::ZERO
             && level.side_price <= maximum_side_price
@@ -122,6 +126,7 @@ pub fn size_position_from_levels(
             if candidate_loss <= risk_budget {
                 gross_cost += take * level.side_price;
                 estimated_fee += level_fee;
+                exact_fee_total += exact_fee(fee_coefficient, take, level.yes_price);
                 quantity += take;
                 break;
             }
@@ -132,6 +137,8 @@ pub fn size_position_from_levels(
     if quantity <= Decimal::ZERO {
         return SizedPosition::empty();
     }
+    let estimated_fee = estimated_fee
+        .min(exact_fee_total.round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven));
     SizedPosition {
         quantity,
         average_side_price: gross_cost / quantity,
@@ -264,19 +271,53 @@ mod tests {
     }
 
     #[test]
+    fn fee_total_is_capped_by_rounded_cumulative_fee() {
+        // 0.0625 * 0.40 * 0.60 = 0.015 per contract at both levels: each fill
+        // rounds up to 0.02 (banker's, 2 is even) but the cumulative exact fee
+        // of 0.03 rounds to 0.03, which is all the venue collects.
+        let result = size_position_from_levels(
+            Decimal::new(2, 0),
+            Decimal::new(625, 4),
+            Decimal::ONE,
+            Decimal::ONE,
+            &[
+                ExecutionLevel {
+                    side_price: Decimal::new(40, 2),
+                    yes_price: Decimal::new(40, 2),
+                    quantity: Decimal::ONE,
+                },
+                ExecutionLevel {
+                    side_price: Decimal::new(60, 2),
+                    yes_price: Decimal::new(60, 2),
+                    quantity: Decimal::ONE,
+                },
+            ],
+        );
+        assert_eq!(result.quantity, Decimal::new(2, 0));
+        assert_eq!(result.estimated_fee, Decimal::new(3, 2));
+        assert_eq!(result.maximum_loss, Decimal::new(103, 2));
+    }
+
+    #[test]
     fn portfolio_enforces_total_exposure_and_duplicate_side() {
-        let mut portfolio = PaperPortfolio {
-            bankroll: Decimal::ONE_HUNDRED,
-            open_exposure: Decimal::ZERO,
-            open_positions: Vec::new(),
-        };
+        let mut portfolio = PaperPortfolio::new(Decimal::ONE_HUNDRED);
         let position = PaperPosition {
             opportunity_id: uuid::Uuid::new_v4(),
             event_id: "event".into(),
             market_id: "market".into(),
+            market_slug: "market".into(),
             side: OutcomeSide::Long,
+            quantity: Decimal::new(6, 0),
+            entry_price: Decimal::new(50, 2),
+            fair_probability: Decimal::new(55, 2),
+            estimated_fee: Decimal::ZERO,
             maximum_loss: Decimal::new(3, 0),
+            start_time: None,
             opened_at: chrono::Utc::now(),
+            closing_price: None,
+            settlement_payout: None,
+            realized_pnl: None,
+            closed_at: None,
         };
         assert!(portfolio.open(position, Decimal::new(5, 0)));
         assert!(portfolio.has_market_side("market", OutcomeSide::Long));

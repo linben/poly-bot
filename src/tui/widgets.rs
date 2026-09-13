@@ -112,6 +112,15 @@ pub fn usd(value: f64) -> String {
     format!("${value:.2}")
 }
 
+/// Signed dollars coloured by sign: `+$1.50`, `-$0.25`.
+pub fn signed_usd(value: f64) -> Span<'static> {
+    let sign = if value < 0.0 { "-" } else { "+" };
+    Span::styled(
+        format!("{sign}${:.2}", value.abs()),
+        Tone::for_signed(value).style(),
+    )
+}
+
 /// Age of an instant as `4s`, `2m05s`, `1h12m`, or `-` when unknown.
 pub fn age(since: Option<DateTime<Utc>>) -> String {
     let Some(since) = since else {
