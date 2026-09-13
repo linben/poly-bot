@@ -1,11 +1,13 @@
 use std::{env, str::FromStr, time::Duration};
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
 /// Where state lives and which event-driven services run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RunMode {
     /// Single host: file-backed store, in-process news loop and terminal UI.
     Local,
@@ -26,7 +28,10 @@ impl FromStr for RunMode {
     }
 }
 
-#[derive(Debug, Clone)]
+/// `Deserialize` reads the JSON a scan was archived with (`#[serde(default)]`
+/// fills fields added since), so a replay can audit under the same gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub run_mode: RunMode,
     pub polymarket_base_url: String,
@@ -89,6 +94,11 @@ pub struct Settings {
     /// settlement price.
     pub settlement_poll: Duration,
     pub source_config_path: String,
+    /// Postgres history archive (`DATABASE_URL`). Optional: unset means the
+    /// file or AWS store alone; set (with the `postgres` feature) records
+    /// every scan's inputs, grades every market seen, and enables `backtest`.
+    #[serde(skip)]
+    pub database_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -127,6 +137,7 @@ impl Default for Settings {
             polymarket_requests_per_second: 18,
             settlement_poll: Duration::from_secs(600),
             source_config_path: "config/sources.json".into(),
+            database_url: None,
         }
     }
 }
@@ -136,6 +147,10 @@ impl Settings {
         let mut settings = Self::default();
         set_string("POLYMARKET_BASE_URL", &mut settings.polymarket_base_url);
         set_string("SOURCE_CONFIG_PATH", &mut settings.source_config_path);
+        settings.database_url = env::var("DATABASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         settings.run_mode = parse_env("RUN_MODE", settings.run_mode)?;
         settings.source_concurrency = parse_env("SOURCE_CONCURRENCY", settings.source_concurrency)?;
         settings.book_concurrency = parse_env("POLYMARKET_CONCURRENCY", settings.book_concurrency)?;

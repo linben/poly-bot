@@ -1,15 +1,45 @@
+# User unit for unattended local mode. Install:
+#   make deploy                                  # immutable target/deploy/<sha>/, `current` symlink
+#   mkdir -p ~/.config/systemd/user && cp deploy/polybot-local.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now polybot-local
+#   loginctl enable-linger $USER                 # keep user units running without a login session
+# Observe: systemctl --user status polybot-local ; journalctl --user -u polybot-local -f ;
+#          cat data/health.json
 [Unit]
-Description=Polybot local mode (scanner, news review; headless)
+Description=Polybot local mode (scanner, news review, settlement; headless)
 After=network-online.target
 Wants=network-online.target
+# Restart forever with RestartSec pacing; a flapping source must not leave
+# the unit stopped.
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# `local` sends READY=1 once the store and sources are up, WATCHDOG=1 after
+# every scan attempt, STATUS= on every state change, STOPPING=1 on shutdown.
+Type=notify
+NotifyAccess=main
 WorkingDirectory=%h/poly-bot
 EnvironmentFile=%h/poly-bot/.env
-ExecStart=%h/poly-bot/target/release/local --headless --data-dir %h/poly-bot/data
-Restart=on-failure
+# Immutable per-commit binary (`make deploy`); a rebuild never swaps the file
+# under a running process.
+ExecStart=%h/poly-bot/target/deploy/current/local --headless --data-dir %h/poly-bot/data
+TimeoutStartSec=120
+# Three scan intervals: a scan that has not finished (or failed) in fifteen
+# minutes is hung, not slow. Scans that fail keep pinging; see health.json.
+WatchdogSec=900
+Restart=always
 RestartSec=10
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+# Mount-namespace sandboxing (ProtectSystem, ProtectHome, PrivateTmp) is left
+# out: as a user unit it depends on unprivileged user namespaces being enabled
+# on the host. Add it when running as a system unit.
 
 [Install]
 WantedBy=default.target

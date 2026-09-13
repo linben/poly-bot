@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
-    domain::{NewsEvidence, Opportunity, PaperPortfolio, ScanSnapshot, ScanSummary, SourceQuote},
+    domain::{NewsEvidence, Opportunity, PaperPortfolio, ScanCapture, ScanSummary},
 };
 
 #[async_trait]
@@ -23,7 +23,8 @@ pub trait Store: Send + Sync {
     async fn release_scan_lease(&self, lease_id: Uuid) -> Result<()>;
     async fn load_portfolio(&self, bankroll: Decimal) -> Result<PaperPortfolio>;
     async fn save_portfolio(&self, portfolio: &PaperPortfolio) -> Result<()>;
-    async fn save_scan(&self, snapshot: &ScanSnapshot, quotes: &[SourceQuote]) -> Result<()>;
+    /// Persist a scan and the inputs it decided on (markets, books, quotes).
+    async fn save_scan(&self, capture: &ScanCapture) -> Result<()>;
     async fn latest_opportunities(&self) -> Result<Vec<Opportunity>>;
     /// Timing and source health of the most recent scan, without its rows.
     async fn latest_scan(&self) -> Result<Option<ScanSummary>>;
@@ -42,17 +43,124 @@ pub trait Store: Send + Sync {
     }
 }
 
+/// Whether a binary writes scans/news that belong in the history archive.
+/// Viewers and the paper CLI only read, so they never open a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Archive {
+    Enabled,
+    Disabled,
+}
+
 /// Build the store for the configured run mode. Cloud requires the `aws`
-/// feature and `DATA_BUCKET`/`STATE_TABLE`/`NEWS_QUEUE_URL`.
-pub async fn store_for(mode: crate::config::RunMode, data_dir: &str) -> Result<Arc<dyn Store>> {
-    match mode {
-        crate::config::RunMode::Local => Ok(Arc::new(LocalStore::new(data_dir)?)),
+/// feature and `DATA_BUCKET`/`STATE_TABLE`/`NEWS_QUEUE_URL`. With
+/// `Archive::Enabled` and `DATABASE_URL` set, the store is wrapped so every
+/// scan and news record is also archived in Postgres (`postgres` feature).
+pub async fn store_for(
+    settings: &crate::config::Settings,
+    data_dir: &str,
+    archive: Archive,
+) -> Result<Arc<dyn Store>> {
+    let store: Arc<dyn Store> = match settings.run_mode {
+        crate::config::RunMode::Local => Arc::new(LocalStore::new(data_dir)?),
         #[cfg(feature = "aws")]
-        crate::config::RunMode::Cloud => Ok(Arc::new(aws::AwsStore::from_env().await?)),
+        crate::config::RunMode::Cloud => Arc::new(aws::AwsStore::from_env().await?),
         #[cfg(not(feature = "aws"))]
-        crate::config::RunMode::Cloud => Err(Error::Config(
-            "RUN_MODE=cloud requires a build with the aws feature".into(),
-        )),
+        crate::config::RunMode::Cloud => {
+            return Err(Error::Config(
+                "RUN_MODE=cloud requires a build with the aws feature".into(),
+            ));
+        }
+    };
+    let Some(url) = settings
+        .database_url
+        .as_ref()
+        .filter(|_| archive == Archive::Enabled)
+    else {
+        return Ok(store);
+    };
+    #[cfg(feature = "postgres")]
+    {
+        let history = crate::history::History::connect(url).await?;
+        Ok(Arc::new(ArchivingStore::new(store, history, settings)?))
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = url;
+        Err(Error::Config(
+            "DATABASE_URL requires a build with the postgres feature".into(),
+        ))
+    }
+}
+
+/// Forwards everything to the operational store and additionally archives
+/// scans and news evidence in Postgres. An archive failure fails the write:
+/// the operator configured the archive, and a silent gap would corrupt every
+/// backtest over the window.
+#[cfg(feature = "postgres")]
+pub struct ArchivingStore {
+    inner: Arc<dyn Store>,
+    history: crate::history::History,
+    settings: serde_json::Value,
+}
+
+#[cfg(feature = "postgres")]
+impl ArchivingStore {
+    pub fn new(
+        inner: Arc<dyn Store>,
+        history: crate::history::History,
+        settings: &crate::config::Settings,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner,
+            history,
+            settings: serde_json::to_value(settings)?,
+        })
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl Store for ArchivingStore {
+    async fn acquire_scan_lease(&self, lease_id: Uuid, ttl: Duration) -> Result<bool> {
+        self.inner.acquire_scan_lease(lease_id, ttl).await
+    }
+    async fn release_scan_lease(&self, lease_id: Uuid) -> Result<()> {
+        self.inner.release_scan_lease(lease_id).await
+    }
+    async fn load_portfolio(&self, bankroll: Decimal) -> Result<PaperPortfolio> {
+        self.inner.load_portfolio(bankroll).await
+    }
+    async fn save_portfolio(&self, portfolio: &PaperPortfolio) -> Result<()> {
+        self.inner.save_portfolio(portfolio).await
+    }
+    async fn save_scan(&self, capture: &ScanCapture) -> Result<()> {
+        self.inner.save_scan(capture).await?;
+        self.history
+            .record_scan(capture, &self.settings, crate::history::Origin::Live)
+            .await?;
+        Ok(())
+    }
+    async fn latest_opportunities(&self) -> Result<Vec<Opportunity>> {
+        self.inner.latest_opportunities().await
+    }
+    async fn latest_scan(&self) -> Result<Option<ScanSummary>> {
+        self.inner.latest_scan().await
+    }
+    async fn news_for(&self, opportunity_id: Uuid) -> Result<Option<NewsEvidence>> {
+        self.inner.news_for(opportunity_id).await
+    }
+    async fn enqueue_news(&self, opportunities: &[Opportunity]) -> Result<()> {
+        self.inner.enqueue_news(opportunities).await
+    }
+    async fn save_news(&self, evidence: &NewsEvidence) -> Result<()> {
+        self.inner.save_news(evidence).await?;
+        self.history.record_news(evidence).await
+    }
+    async fn take_news_queue(&self) -> Result<Vec<Opportunity>> {
+        self.inner.take_news_queue().await
+    }
+    async fn prune(&self, retention: Duration) -> Result<usize> {
+        self.inner.prune(retention).await
     }
 }
 
@@ -60,6 +168,25 @@ pub async fn store_for(mode: crate::config::RunMode, data_dir: &str) -> Result<A
 struct LocalLease {
     lease_id: Uuid,
     expires_at: DateTime<Utc>,
+}
+
+/// Write to a sibling temp file and rename over the target. `latest-*.json`,
+/// `portfolio.json` and `health.json` are re-read every couple of seconds by
+/// the UI or a watchdog, and rename is the only atomic replace a plain
+/// filesystem offers.
+pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| Error::Storage(format!("create {}: {error}", parent.display())))?;
+    }
+    let content = serde_json::to_vec_pretty(value)?;
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, content)
+        .map_err(|error| Error::Storage(format!("write {}: {error}", temporary.display())))?;
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        Error::Storage(format!("replace {}: {error}", path.display()))
+    })
 }
 
 pub struct LocalStore {
@@ -74,22 +201,8 @@ impl LocalStore {
         Ok(Self { root })
     }
 
-    /// Write to a sibling temp file and rename over the target. `latest-*.json`
-    /// and `portfolio.json` are re-read every couple of seconds by the UI, and
-    /// rename is the only atomic replace a plain filesystem offers.
     fn write_json(&self, path: &Path, value: &impl serde::Serialize) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| Error::Storage(format!("create {}: {error}", parent.display())))?;
-        }
-        let content = serde_json::to_vec_pretty(value)?;
-        let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, content)
-            .map_err(|error| Error::Storage(format!("write {}: {error}", temporary.display())))?;
-        fs::rename(&temporary, path).map_err(|error| {
-            let _ = fs::remove_file(&temporary);
-            Error::Storage(format!("replace {}: {error}", path.display()))
-        })
+        write_json_atomic(path, value)
     }
 
     fn append_json_line(&self, path: &Path, value: &impl serde::Serialize) -> Result<()> {
@@ -238,7 +351,8 @@ impl Store for LocalStore {
         self.write_json(&self.root.join("portfolio.json"), portfolio)
     }
 
-    async fn save_scan(&self, snapshot: &ScanSnapshot, quotes: &[SourceQuote]) -> Result<()> {
+    async fn save_scan(&self, capture: &ScanCapture) -> Result<()> {
+        let snapshot = &capture.snapshot;
         let date = snapshot.started_at;
         let partition = self.root.join(format!(
             "scans/year={}/month={:02}/day={:02}",
@@ -252,7 +366,15 @@ impl Store for LocalStore {
         )?;
         self.write_json(
             &partition.join(format!("{}-quotes.json", snapshot.scan_id)),
-            &quotes,
+            &capture.quotes,
+        )?;
+        self.write_json(
+            &partition.join(format!("{}-markets.json", snapshot.scan_id)),
+            &capture.markets,
+        )?;
+        self.write_json(
+            &partition.join(format!("{}-books.json", snapshot.scan_id)),
+            &capture.books,
         )?;
         self.write_json(
             &self.root.join("latest-opportunities.json"),
@@ -543,7 +665,8 @@ pub mod aws {
             Ok(())
         }
 
-        async fn save_scan(&self, snapshot: &ScanSnapshot, quotes: &[SourceQuote]) -> Result<()> {
+        async fn save_scan(&self, capture: &ScanCapture) -> Result<()> {
+            let snapshot = &capture.snapshot;
             let date = snapshot.started_at;
             let prefix = format!(
                 "scans/year={}/month={:02}/day={:02}/{}",
@@ -553,7 +676,11 @@ pub mod aws {
                 snapshot.scan_id
             );
             self.put_json(format!("{prefix}.json"), snapshot).await?;
-            self.put_json(format!("{prefix}-quotes.json"), &quotes)
+            self.put_json(format!("{prefix}-quotes.json"), &capture.quotes)
+                .await?;
+            self.put_json(format!("{prefix}-markets.json"), &capture.markets)
+                .await?;
+            self.put_json(format!("{prefix}-books.json"), &capture.books)
                 .await?;
             for opportunity in &snapshot.opportunities {
                 let item = serde_json::to_string(opportunity)?;

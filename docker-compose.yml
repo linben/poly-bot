@@ -1,0 +1,23 @@
+# Optional Postgres for the history archive. Nothing in Polybot requires it:
+# leave DATABASE_URL unset to run the file store alone. With it set (and a
+# build with --features postgres) every scan's inputs are archived, every
+# market seen is graded against the venue's settlement, and `backtest` runs.
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: polybot
+      POSTGRES_PASSWORD: polybot
+      POSTGRES_DB: polybot
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - polybot-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polybot -d polybot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  polybot-postgres:

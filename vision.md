@@ -139,15 +139,19 @@ before any proposal for authenticated live trading.
 ## Future Direction
 
 Settlement ingestion, paper P&L, and closing-line value are recorded per
-position. After sufficient paper history:
+position. With the optional Postgres archive, every scan's inputs are kept
+and every market seen is graded, so the same questions can be asked of the
+whole evaluated universe rather than a handful of paper positions, and
+`backtest` replays the classifier over that history using only point-in-time
+data. After sufficient history:
 
 1. Fit `CONSENSUS_BIAS` and the exchange lead window from realized
-   calibration instead of literature priors.
+   calibration (the archive's reliability buckets) instead of literature
+   priors.
 2. Measure drawdown, source contribution, and maker-vs-taker fill assumptions
    against the recorded closing lines.
-3. Add replayable historical backtests using only point-in-time data.
-4. Tune sport-specific matching and settlement policies.
-5. Evaluate whether a separate, explicitly approved live-execution service is
+3. Tune sport-specific matching and settlement policies.
+4. Evaluate whether a separate, explicitly approved live-execution service is
    justified.
 
 Any live-execution phase must remain isolated from research, use separate

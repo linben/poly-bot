@@ -180,7 +180,7 @@ pub struct ConsensusPrice {
     pub newest_source_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeSide {
     Long,
@@ -430,7 +430,13 @@ pub struct ResearchOpportunity {
 
 impl ResearchOpportunity {
     pub fn new(opportunity: Opportunity, news: Option<NewsEvidence>) -> Self {
-        let effective_class = effective_recommendation(opportunity.class, news.as_ref());
+        Self::at(opportunity, news, Utc::now())
+    }
+
+    /// `now` bounds news freshness: evidence older than two hours cannot
+    /// preserve an actionable class.
+    pub fn at(opportunity: Opportunity, news: Option<NewsEvidence>, now: DateTime<Utc>) -> Self {
+        let effective_class = effective_recommendation(opportunity.class, news.as_ref(), now);
         Self {
             opportunity,
             effective_class,
@@ -442,10 +448,11 @@ impl ResearchOpportunity {
 fn effective_recommendation(
     recommendation: RecommendationClass,
     news: Option<&NewsEvidence>,
+    now: DateTime<Utc>,
 ) -> RecommendationClass {
     let fresh_news = news.filter(|evidence| {
-        evidence.generated_at >= Utc::now() - chrono::Duration::hours(2)
-            && evidence.generated_at <= Utc::now() + chrono::Duration::minutes(1)
+        evidence.generated_at >= now - chrono::Duration::hours(2)
+            && evidence.generated_at <= now + chrono::Duration::minutes(1)
     });
     match (recommendation, fresh_news) {
         (RecommendationClass::Rejected, _) => RecommendationClass::Rejected,
@@ -480,35 +487,39 @@ mod tests {
 
     #[test]
     fn actionable_requires_completed_unchanged_news() {
+        let now = Utc::now();
         assert_eq!(
-            effective_recommendation(RecommendationClass::Actionable, None),
+            effective_recommendation(RecommendationClass::Actionable, None, now),
             RecommendationClass::Watchlist
         );
         assert_eq!(
             effective_recommendation(
                 RecommendationClass::Actionable,
-                Some(&evidence("unchanged", false))
+                Some(&evidence("unchanged", false)),
+                now
             ),
             RecommendationClass::Actionable
         );
         assert_eq!(
             effective_recommendation(
                 RecommendationClass::Actionable,
-                Some(&evidence("lower", false))
+                Some(&evidence("lower", false)),
+                now
             ),
             RecommendationClass::Watchlist
         );
         assert_eq!(
             effective_recommendation(
                 RecommendationClass::Actionable,
-                Some(&evidence("reject", false))
+                Some(&evidence("reject", false)),
+                now
             ),
             RecommendationClass::Rejected
         );
         let mut stale = evidence("unchanged", false);
-        stale.generated_at = Utc::now() - chrono::Duration::hours(3);
+        stale.generated_at = now - chrono::Duration::hours(3);
         assert_eq!(
-            effective_recommendation(RecommendationClass::Actionable, Some(&stale)),
+            effective_recommendation(RecommendationClass::Actionable, Some(&stale), now),
             RecommendationClass::Watchlist
         );
     }
@@ -518,11 +529,31 @@ mod tests {
 pub struct ScanSnapshot {
     pub scan_id: Uuid,
     pub started_at: DateTime<Utc>,
+    /// The `now` every freshness, lead, and news check in this scan used.
+    /// Replays evaluate stored inputs at this instant. Snapshots written
+    /// before this field existed read as the Unix epoch; see
+    /// [`ScanSnapshot::evaluated_at_or_completed`].
+    #[serde(default)]
+    pub evaluated_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub market_count: usize,
     pub quote_count: usize,
     pub opportunities: Vec<Opportunity>,
     pub source_health: Vec<SourceHealth>,
+}
+
+/// Everything a scan observed and decided: the inputs (markets, books,
+/// quotes, the paper portfolio whose exposure shaped sizing) alongside the
+/// snapshot, so the decision can be reproduced later with the same or
+/// different gates. Books exist only for markets that had a consensus; the
+/// rest were never fetched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanCapture {
+    pub snapshot: ScanSnapshot,
+    pub markets: Vec<UsMoneylineMarket>,
+    pub books: Vec<MarketBook>,
+    pub quotes: Vec<SourceQuote>,
+    pub portfolio: PaperPortfolio,
 }
 
 /// Everything about a scan except its opportunity rows; small enough for a
@@ -555,5 +586,18 @@ impl ScanSnapshot {
                 .count(),
             source_health: self.source_health.clone(),
         }
+    }
+
+    /// `evaluated_at`, or the best proxy an older snapshot offers: the first
+    /// opportunity's `generated_at` (the engine's clock at the time), else
+    /// `completed_at`.
+    pub fn evaluated_at_or_completed(&self) -> DateTime<Utc> {
+        if self.evaluated_at != DateTime::<Utc>::default() {
+            return self.evaluated_at;
+        }
+        self.opportunities
+            .first()
+            .map(|item| item.generated_at)
+            .unwrap_or(self.completed_at)
     }
 }

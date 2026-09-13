@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -48,15 +48,17 @@ pub fn remove_vig(quote: &SourceQuote) -> Result<FairQuote> {
     })
 }
 
-/// Builds a robust consensus from quotes observed within `max_quote_age_seconds`.
-/// Freshness is judged by `fetched_at` (when we last saw the book display the
-/// line); `source_timestamp` is when the book last moved it and only breaks
-/// ties, because an unmoved line is still a live price.
+/// Builds a robust consensus from quotes observed within `max_quote_age_seconds`
+/// of `now`. Freshness is judged by `fetched_at` (when we last saw the book
+/// display the line); `source_timestamp` is when the book last moved it and
+/// only breaks ties, because an unmoved line is still a live price. `now` is
+/// the scan's evaluation time so a replay over stored quotes reproduces the
+/// live decision.
 pub fn build_consensus(
     quotes: &[SourceQuote],
     max_quote_age_seconds: i64,
+    now: DateTime<Utc>,
 ) -> Result<ConsensusPrice> {
-    let now = Utc::now();
     let cutoff = now - chrono::Duration::seconds(max_quote_age_seconds);
     let future_limit = now + chrono::Duration::seconds(30);
     let mut newest_by_family: HashMap<SourceFamily, &SourceQuote> = HashMap::new();
@@ -201,7 +203,7 @@ mod tests {
             quote("fanduel", SourceFamily::FanDuel, 192, 198),
             quote("bad", SourceFamily::Validation("bad".into()), 101, 900),
         ];
-        let result = build_consensus(&quotes, 600).unwrap();
+        let result = build_consensus(&quotes, 600, Utc::now()).unwrap();
         assert_eq!(result.family_count, 3);
         assert!(result.has_reference);
         assert!(result.probability_a < Decimal::new(60, 2));
@@ -225,6 +227,7 @@ mod tests {
                 quote("pinnacle", SourceFamily::Pinnacle, 190, 200),
             ],
             300,
+            Utc::now(),
         )
         .unwrap();
         assert_eq!(result.family_count, 1);

@@ -16,8 +16,8 @@ use crate::{
     config::Settings,
     consensus::build_consensus,
     domain::{
-        Opportunity, PaperPortfolio, RecommendationClass, ScanSnapshot, SourceFamily, SourceHealth,
-        SourceQuote, Sport, UsMoneylineMarket,
+        ConsensusPrice, MarketBook, Opportunity, PaperPortfolio, RecommendationClass, ScanCapture,
+        ScanSnapshot, SourceFamily, SourceHealth, SourceQuote, Sport, UsMoneylineMarket,
     },
     matching::{match_quote, orient_quote},
     opportunity::OpportunityEngine,
@@ -139,19 +139,20 @@ impl Scanner {
         let (quotes, source_health) = self.collect_sources(&continuous, &Sport::ALL).await;
         let portfolio = self.store.load_portfolio(self.settings.bankroll).await?;
         let preliminary = self
-            .evaluate_markets(&markets, &quotes, &portfolio, None)
+            .evaluate_markets(&markets, &quotes, &portfolio, None, Utc::now())
             .await;
         let candidate_sports = preliminary
+            .opportunities
             .iter()
             .filter(|item| item.class != RecommendationClass::Rejected)
             .map(|item| item.sport)
             .collect::<HashSet<_>>();
 
-        let (final_quotes, mut opportunities, mut all_health) = if candidate_sports.is_empty() {
+        let (final_quotes, evaluation, mut all_health) = if candidate_sports.is_empty() {
             (quotes, preliminary, source_health)
         } else {
             let sports = candidate_sports.into_iter().collect::<Vec<_>>();
-            let confirmation_sources = self.confirmation_sources(&preliminary);
+            let confirmation_sources = self.confirmation_sources(&preliminary.opportunities);
             let (confirmation_quotes, confirmation_health) =
                 self.collect_sources(&confirmation_sources, &sports).await;
             let merged_quotes =
@@ -162,25 +163,40 @@ impl Scanner {
                     &merged_quotes,
                     &portfolio,
                     Some(confirmation_sources.as_slice()),
+                    Utc::now(),
                 )
                 .await;
             let mut health = source_health;
             health.extend(confirmation_health);
             (merged_quotes, confirmed, health)
         };
+        let Evaluation {
+            evaluated_at,
+            mut opportunities,
+            books,
+        } = evaluation;
         opportunities.sort_by_key(|opportunity| Reverse(opportunity.net_edge));
         deduplicate_health(&mut all_health);
 
         let snapshot = ScanSnapshot {
             scan_id,
             started_at,
+            evaluated_at,
             completed_at: Utc::now(),
             market_count: markets.len(),
             quote_count: final_quotes.len(),
             opportunities,
             source_health: all_health,
         };
-        self.store.save_scan(&snapshot, &final_quotes).await?;
+        let capture = ScanCapture {
+            snapshot,
+            markets: Arc::unwrap_or_clone(markets),
+            books,
+            quotes: final_quotes,
+            portfolio,
+        };
+        self.store.save_scan(&capture).await?;
+        let snapshot = capture.snapshot;
         let news_candidates = snapshot
             .opportunities
             .iter()
@@ -326,9 +342,8 @@ impl Scanner {
         quotes: &[SourceQuote],
         portfolio: &PaperPortfolio,
         refetched: Option<&[SharedSource]>,
-    ) -> Vec<Opportunity> {
-        let engine = OpportunityEngine::new(self.settings.clone());
-        let now = Utc::now();
+        now: DateTime<Utc>,
+    ) -> Evaluation {
         let quotes = match refetched {
             Some(refetched) => apply_confirmation_window(
                 quotes,
@@ -338,52 +353,100 @@ impl Scanner {
             ),
             None => quotes.iter().collect(),
         };
-        let max_age_seconds = self.settings.max_quote_age.as_secs() as i64;
-        let exchange_max_lead =
-            chrono::Duration::from_std(self.settings.exchange_max_lead).unwrap_or_default();
-        let evaluable = markets
-            .iter()
-            .filter(|market| market.start_time > now)
-            .filter_map(|market| {
-                let exclude_exchanges = market.start_time - now > exchange_max_lead;
-                let matching = quotes
-                    .iter()
-                    .filter(|quote| !(exclude_exchanges && is_exchange_family(&quote.family)))
-                    .filter_map(|quote| {
-                        match_quote(market, quote)
-                            .map(|orientation| orient_quote(quote, orientation))
-                    })
-                    .collect::<Vec<_>>();
-                match build_consensus(&matching, max_age_seconds) {
-                    Ok(consensus) => Some((market, consensus)),
-                    Err(error) if matching.is_empty() => {
-                        debug!(market = %market.market_slug, %error, "consensus unavailable");
-                        None
-                    }
-                    Err(error) => {
-                        warn!(market = %market.market_slug, %error, "consensus unavailable");
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
+        let evaluable = consensus_markets(markets, &quotes, &self.settings, now);
         let slugs = evaluable
             .iter()
             .map(|(market, _)| market.market_slug.as_str())
             .collect::<Vec<_>>();
-        let books = self.polymarket.fetch_books(&slugs).await;
+        let fetched = self.polymarket.fetch_books(&slugs).await;
 
-        let mut opportunities = Vec::new();
-        for ((market, consensus), book) in evaluable.iter().zip(books) {
+        let mut books = Vec::with_capacity(fetched.len());
+        for ((market, _), book) in evaluable.iter().zip(fetched) {
             match book {
-                Ok(book) => {
-                    opportunities.extend(engine.evaluate(market, &book, consensus, portfolio))
-                }
+                Ok(book) => books.push(book),
                 Err(error) => warn!(market = market.market_slug, %error, "book fetch failed"),
             }
         }
-        opportunities
+        let opportunities = evaluate_books(&self.settings, &evaluable, &books, portfolio, now);
+        Evaluation {
+            evaluated_at: now,
+            opportunities,
+            books,
+        }
     }
+}
+
+/// One evaluation pass: the clock it used, its rows, and the books it
+/// fetched (only for markets that had a consensus).
+struct Evaluation {
+    evaluated_at: DateTime<Utc>,
+    opportunities: Vec<Opportunity>,
+    books: Vec<MarketBook>,
+}
+
+/// Every market not yet started that has a consensus from `quotes` as of
+/// `now`. Shared by the live scan and the replay so both match, orient, and
+/// filter quotes identically.
+pub fn consensus_markets<'a>(
+    markets: &'a [UsMoneylineMarket],
+    quotes: &[&SourceQuote],
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> Vec<(&'a UsMoneylineMarket, ConsensusPrice)> {
+    let max_age_seconds = settings.max_quote_age.as_secs() as i64;
+    let exchange_max_lead =
+        chrono::Duration::from_std(settings.exchange_max_lead).unwrap_or_default();
+    markets
+        .iter()
+        .filter(|market| market.start_time > now)
+        .filter_map(|market| {
+            let exclude_exchanges = market.start_time - now > exchange_max_lead;
+            let matching = quotes
+                .iter()
+                .filter(|quote| !(exclude_exchanges && is_exchange_family(&quote.family)))
+                .filter_map(|quote| {
+                    match_quote(market, quote).map(|orientation| orient_quote(quote, orientation))
+                })
+                .collect::<Vec<_>>();
+            match build_consensus(&matching, max_age_seconds, now) {
+                Ok(consensus) => Some((market, consensus)),
+                Err(error) if matching.is_empty() => {
+                    debug!(market = %market.market_slug, %error, "consensus unavailable");
+                    None
+                }
+                Err(error) => {
+                    warn!(market = %market.market_slug, %error, "consensus unavailable");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Classify every market in `evaluable` whose book is present in `books`
+/// (matched by slug). Markets without a book are skipped: the live scan
+/// failed to fetch it, or the replay never stored one.
+pub fn evaluate_books(
+    settings: &Settings,
+    evaluable: &[(&UsMoneylineMarket, ConsensusPrice)],
+    books: &[MarketBook],
+    portfolio: &PaperPortfolio,
+    now: DateTime<Utc>,
+) -> Vec<Opportunity> {
+    let engine = OpportunityEngine::new(settings.clone());
+    let by_slug = books
+        .iter()
+        .map(|book| (book.market_slug.as_str(), book))
+        .collect::<HashMap<_, _>>();
+    evaluable
+        .iter()
+        .filter_map(|(market, consensus)| {
+            by_slug
+                .get(market.market_slug.as_str())
+                .map(|book| engine.evaluate(market, book, consensus, portfolio, now))
+        })
+        .flatten()
+        .collect()
 }
 
 /// Exchange prices are calibrated close to the start; further out they are

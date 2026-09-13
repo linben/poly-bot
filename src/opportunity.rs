@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -20,16 +20,20 @@ impl OpportunityEngine {
         Self { settings }
     }
 
+    /// Classify both sides of `market` as of `now`, the scan's evaluation
+    /// time. Every age and lead check is relative to it so a replay over
+    /// stored books reproduces the live decision.
     pub fn evaluate(
         &self,
         market: &UsMoneylineMarket,
         book: &MarketBook,
         consensus: &ConsensusPrice,
         portfolio: &PaperPortfolio,
+        now: DateTime<Utc>,
     ) -> Vec<Opportunity> {
         vec![
-            self.evaluate_side(market, book, consensus, portfolio, OutcomeSide::Long),
-            self.evaluate_side(market, book, consensus, portfolio, OutcomeSide::Short),
+            self.evaluate_side(market, book, consensus, portfolio, OutcomeSide::Long, now),
+            self.evaluate_side(market, book, consensus, portfolio, OutcomeSide::Short, now),
         ]
     }
 
@@ -40,6 +44,7 @@ impl OpportunityEngine {
         consensus: &ConsensusPrice,
         portfolio: &PaperPortfolio,
         side: OutcomeSide,
+        now: DateTime<Utc>,
     ) -> Opportunity {
         let mut reasons = Vec::new();
         let (participant, fair, dispersion, top_price, top_yes_price, levels, maker_price) =
@@ -93,13 +98,11 @@ impl OpportunityEngine {
         if market.ep3_status != "OPEN" {
             reasons.push(format!("market status is {}", market.ep3_status));
         }
-        let book_age = Utc::now()
-            .signed_duration_since(book.fetched_at)
-            .num_seconds();
+        let book_age = now.signed_duration_since(book.fetched_at).num_seconds();
         if book_age < 0 || book_age > self.settings.book_max_age.as_secs() as i64 {
             reasons.push(format!("book snapshot is {book_age}s old"));
         }
-        if book.transact_time > Utc::now() + chrono::Duration::minutes(1) {
+        if book.transact_time > now + chrono::Duration::minutes(1) {
             reasons.push("book transact time is in the future".into());
         }
         if top_price < self.settings.minimum_price || top_price > self.settings.maximum_price {
@@ -120,7 +123,7 @@ impl OpportunityEngine {
             reasons.push("paper portfolio already has this market side".into());
         }
 
-        let lead = market.start_time - Utc::now();
+        let lead = market.start_time - now;
         let minimum_lead_seconds = self.settings.minimum_lead.as_secs() as i64;
         if lead.num_seconds() < minimum_lead_seconds {
             reasons.push(format!(
@@ -260,7 +263,7 @@ impl OpportunityEngine {
                 &Uuid::NAMESPACE_URL,
                 format!("polybot:{}:{side:?}", market.market_id).as_bytes(),
             ),
-            generated_at: Utc::now(),
+            generated_at: now,
             class,
             sport: market.sport,
             event_id: market.event_id.clone(),
@@ -381,7 +384,7 @@ mod tests {
         consensus: &ConsensusPrice,
     ) -> Opportunity {
         OpportunityEngine::new(settings)
-            .evaluate(market, &book(), consensus, &portfolio())
+            .evaluate(market, &book(), consensus, &portfolio(), Utc::now())
             .into_iter()
             .find(|item| item.side == OutcomeSide::Short)
             .unwrap()
@@ -394,6 +397,7 @@ mod tests {
             &book(),
             &consensus(),
             &portfolio(),
+            Utc::now(),
         );
         let short = opportunities
             .iter()
@@ -492,6 +496,7 @@ mod tests {
             &book,
             &consensus(),
             &portfolio(),
+            Utc::now(),
         );
         assert!(
             opportunities

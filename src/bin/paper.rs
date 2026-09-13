@@ -4,7 +4,7 @@ use polybot::{
     config::Settings,
     paper::{close_position, open_position, settle_positions},
     polymarket::PolymarketUsClient,
-    storage::store_for,
+    storage::{Archive, store_for},
 };
 use uuid::Uuid;
 
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     polybot::init_tracing();
     let args = Args::parse();
     let settings = Settings::from_env()?;
-    let store = store_for(settings.run_mode, &args.data_dir).await?;
+    let store = store_for(&settings, &args.data_dir, Archive::Disabled).await?;
     let portfolio = match args.command {
         Command::List => store.load_portfolio(settings.bankroll).await?,
         Command::Open { opportunity_id } => {

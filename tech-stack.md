@@ -12,7 +12,8 @@
 | Numeric model | rust_decimal | Odds, probabilities, fees, VWAP, and risk without floats |
 | Time and IDs | Chrono and UUID | UTC freshness checks and stable market-side IDs |
 | Observability | tracing | Structured scanner and Lambda logs |
-| CLI | Clap | Scanner, source probe, terminal UI, and paper position commands |
+| CLI | Clap | Scanner, source probe, terminal UI, paper position, history and backtest commands |
+| History archive (optional) | Postgres via sqlx | Durable scan inputs, outcome grading for every market seen, replayable backtests |
 
 AWS SDK crates are feature-gated behind the `aws` Cargo feature. Browser
 collection support is feature-gated behind `browser`; it is not enabled for
@@ -48,6 +49,63 @@ deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
 `DisabledReviewer`. `Store::take_news_queue` and `Store::prune` are the two
 local-only operations; the AWS store's defaults are no-ops because SQS and S3
 lifecycle rules own those concerns.
+
+### Daemon liveness
+
+`health::HealthSnapshot` is built from the TUI's `EngineStatus` channel and
+written to `<data-dir>/health.json` by a publisher task in `local` on every
+status change (`storage::write_json_atomic`, shared with `latest-*.json`).
+`health::systemd` wraps `sd-notify` (Linux only; no-op elsewhere or without
+`NOTIFY_SOCKET`): `READY=1` after the loops spawn, `WATCHDOG=1` at the end of
+every scan attempt in `run_scan`, `STATUS=` with the health line, `STOPPING=1`
+on shutdown. `deploy/polybot-local.service` is `Type=notify`,
+`WatchdogSec=900` (three scan intervals), `Restart=always`, and runs the
+immutable `target/deploy/current/local` produced by `make deploy`. `local`
+handles SIGTERM like Ctrl-C so systemd stops drain the current step.
+`build.rs` embeds the short git commit as `POLYBOT_GIT_COMMIT` for the health
+file.
+
+### History archive (`postgres` feature)
+
+`storage::store_for(settings, data_dir, Archive)` wraps the mode store in
+`ArchivingStore` when `DATABASE_URL` is set and the binary writes scans
+(`local`, `scanner`; viewers pass `Archive::Disabled`). The wrapper forwards
+every `Store` call and additionally records `save_scan` and `save_news` into
+Postgres through `history::History`. An archive failure fails the scan: the
+operator asked for the archive, and a silent gap would corrupt every backtest
+over the window. Without `DATABASE_URL` nothing is opened; with it and no
+`postgres` feature, startup fails with a clear config error.
+
+Stack: `sqlx 0.8` (postgres, rustls, `rust_decimal` → `NUMERIC`, `uuid`,
+`chrono`, `json`), one `PgPool` of four connections, migrations as plain SQL
+in `migrations/` embedded with `sqlx::migrate!` and applied on connect. Tables
+(`migrations/202609130001_history.sql`): `scans` (clock, gates, portfolio,
+source health, origin `live|import`), `markets` (slowly changing, latest
+definition as JSONB), `scan_books` (bids/offers per scan and market, with the
+market fields that vary between scans), `scan_quotes` (raw quote JSONB plus
+filter columns), `opportunities` (every side, flattened), `news_evidence`,
+`market_outcomes` (closing line, settlement, attempts, backoff), and
+`backtest_runs`. Every row keeps observation time (`fetched_at`,
+`evaluated_at`) apart from event time (`start_time`, `source_timestamp`).
+
+Determinism is what makes the archive replayable: `consensus::build_consensus`,
+`OpportunityEngine::evaluate`, and `ResearchOpportunity::at` take `now`
+explicitly, the scanner evaluates a whole pass at one instant recorded as
+`ScanSnapshot::evaluated_at`, and `scanner::consensus_markets` /
+`scanner::evaluate_books` are the shared pure functions both the live pass and
+`replay::Replay` call. `backtest --audit` recomputes every live frame under
+its archived gates and portfolio and diffs it against the stored rows; the
+mismatch count is the regression guard for that seam.
+
+`History::grade_outcomes` (engine settlement tick and `history grade`) walks
+markets past start without a settlement, inside a 14-day window, in batches
+of `GRADING_BATCH` with a 10 min → 1 h → 6 h backoff per market, fetching the
+closing line once and the settlement until published. `History::reader()`
+opens a `REPEATABLE READ READ ONLY` transaction so a replay sees one snapshot
+of frames and outcomes. `replay::Replay` steps frames in order, settles
+positions `settlement_lag_hours` after start when an outcome exists, and never
+fills an order against the book it was decided on under `FillModel::NextBook`.
+`metrics` holds the pure Brier / reliability / summary / drawdown arithmetic.
 
 Local performance choices, all measured against live endpoints: Polymarket
 discovery runs the five sports concurrently with gzip and is cached for
