@@ -21,14 +21,15 @@ unapproved sportsbook automation.
 ### Terminal UI
 
 `tui` renders with ratatui on a crossterm backend. The render loop draws on
-change, not on a fixed frame rate: `event::poll` waits up to 100 ms for a key,
-and a frame is redrawn only when the store or engine state changed or the 1 s
-clock ticked (scan age and countdown). The store is polled every 2 s in local
-mode and every 10 s in cloud mode. While the TUI owns the terminal, `tracing`
-output is captured into an in-memory ring buffer that feeds the LOG panels
-instead of being written to stderr. Views: Overview, Markets, Sources,
-Portfolio, System (`Tab` / `1`-`5`); Portfolio's `o`/`c` reuse the `paper
-open`/`close` rules.
+change, not on a fixed frame rate: crossterm's `EventStream`, the store
+snapshot channel, the engine status channel and a 1 s clock (scan age and
+countdown) are one `tokio::select!`, and a frame is redrawn only when one of
+them fires. The store is polled off the render loop every 2 s in local mode
+and every 10 s in cloud mode into an immutable snapshot. While the TUI owns the
+terminal, `tracing` output is captured into a 500-line in-memory ring buffer
+that feeds the LOG panels instead of being written to stderr. Views: Overview,
+Markets, Sources, Portfolio, System (`Tab` / `1`-`5`); `o` on Overview or
+Markets and `c` on Portfolio reuse the `paper open`/`close` rules.
 
 ## Run Modes
 
@@ -82,8 +83,11 @@ The task:
 ### Lambda
 
 One Rust Lambda function, `news-worker`, handles the event-driven work: it
-consumes SQS messages, calls Exa search and Bedrock, and stores cited news
-evidence.
+consumes SQS messages, calls Exa search and Bedrock (`BedrockNewsEnricher`),
+and stores cited news evidence. It reads `BEDROCK_MODEL_ID` and, unless
+`EXA_API_KEY` is set directly, the `exa_api_key` field of the Secrets Manager
+secret named by `APP_SECRET_ID`. Records with evidence newer than
+`NEWS_REFRESH_SECONDS` are skipped without a search.
 
 The news worker returns partial batch failures so one bad record does not
 replay an entire successful SQS batch.
@@ -128,9 +132,10 @@ IDs and a one-hour evidence cache prevent duplicate five-minute search calls.
 
 ### Secrets Manager
 
-The application secret stores the Exa API key. The news Lambda reads it
-at runtime. The Odds API key, when used, is supplied to the scanner task as
-`THE_ODDS_API_KEY`.
+The application secret is a JSON object. The news Lambda reads `exa_api_key`
+at runtime; the ECS task receives `the_odds_api_key` as `THE_ODDS_API_KEY`
+when `enable_the_odds_api` is set. Terraform creates the secret empty;
+`README.md` shows the `put-secret-value` call that populates it.
 
 ## External APIs
 
@@ -185,8 +190,34 @@ five-family quorum are enforced per opportunity at runtime.
 
 ### Exa Search and Bedrock
 
-Exa search retrieves recent injury, lineup, suspension, withdrawal, weather,
-and schedule evidence. Bedrock runs an Anthropic-compatible request that must
+`news::ExaSearchClient` posts to `https://api.exa.ai/search` with the key in
+`x-api-key` and the request timeout of the calling process (the scanner's
+`request_timeout`, 15 s in the Lambda). Per candidate it sends one request:
+
+```json
+{
+  "query": "<participant> <market slug> <sport> injury lineup suspension withdrawal weather schedule latest",
+  "numResults": 8,
+  "moderation": true,
+  "contents": { "highlights": true }
+}
+```
+
+Each result becomes a `NewsCitation` (title, URL, published time, snippet).
+The snippet is the joined highlights, which is what gives the keyword
+classifier and Bedrock roster and injury text to work with. No
+`startPublishedDate` or `category` filter is sent: Exa excludes undated pages
+under a date filter, and game-day injury tables (ESPN, FOX, StatMuse, CBS)
+carry no published date; the dated market slug keeps results on the right
+game. `publishedDate` is parsed as RFC 3339 or `YYYY-MM-DD` because the docs
+and responses disagree. Exa replaced Brave Search when Brave dropped its free
+API plan; the client is the only place the provider is named, so swapping it
+again means one struct.
+
+`KeywordReviewer` classifies the citations deterministically (participant
+must be named; hard terms force `review`, soft terms `lower`, no citations
+`review`). `BedrockNewsEnricher` instead sends the numbered citations to an
+Anthropic-compatible Bedrock request (`temperature` 0, 500 tokens) that must
 return strict JSON:
 
 ```json
@@ -197,8 +228,10 @@ return strict JSON:
 }
 ```
 
-Allowed effects are `unchanged`, `lower`, `reject`, and `review`. Evidence
-older than two hours cannot preserve an actionable classification.
+Allowed effects are `unchanged`, `lower`, `reject`, and `review`; any other
+value is an error and the SQS record is retried. Zero citations short-circuit
+to `review` with manual review before the model is called. Evidence older than
+two hours cannot preserve an actionable classification.
 
 ## Domain Logic
 

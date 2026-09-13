@@ -33,10 +33,12 @@ architecture and technology choices are documented in
   fail closed if the quorum no longer holds
 - Freshness: a quote is fresh by when it was last observed, not by when the
   book last moved the line; an unmoved line is still a live price
-- News gate: a candidate remains watchlist until Bedrock returns corroborated
-  `unchanged` evidence; `lower`, `review`, and `reject` downgrade it
-- News cache: stable market-side IDs reuse evidence for one hour; evidence
-  older than two hours cannot preserve an actionable class
+- News gate: a candidate remains watchlist until the news reviewer returns
+  corroborated `unchanged` evidence; `lower`, `review`, and `reject` downgrade
+  it
+- News cache: stable market-side IDs reuse evidence for `NEWS_REFRESH_SECONDS`
+  (default 3600); evidence older than two hours cannot preserve an actionable
+  class
 
 Polymarket US exposes one YES book. The engine interprets:
 
@@ -54,7 +56,7 @@ the same scanner, consensus, sizing, and news logic.
 | | `local` (default) | `cloud` |
 | --- | --- | --- |
 | Process | one `local` binary: scan loop, news loop, retention, terminal UI | ECS one-shot `scanner`, Lambda `news-worker` |
-| Store | files under `data/` (`scans/`, `latest-opportunities.json`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
+| Store | files under `data/` (`scans/`, `latest-opportunities.json`, `latest-scan.json`, `opportunities.ndjson`, `news-queue.ndjson`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
 | News reviewer | `keyword` (Exa + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
 | Dashboard | terminal UI in-process, or `tui` attached to `data/` | `tui` with `RUN_MODE=cloud` and AWS credentials |
 | Requires | Rust toolchain, outbound HTTPS | AWS account, Terraform, Docker, cargo-lambda |
@@ -161,11 +163,24 @@ preserve or downgrade a candidate.
   `review` with manual review, soft terms (questionable, doubtful, injury,
   weather delay) give `lower`, otherwise `unchanged`. No citations at all is
   `review`.
-- `bedrock`: Exa search summarized by Bedrock (build with `--features aws`).
+- `bedrock`: the same Exa citations summarized by Bedrock (build with
+  `--features aws`; needs `BEDROCK_MODEL_ID` and AWS credentials).
 - none (default without an Exa key): no evidence is written, so nothing can
   leave the watchlist.
 - `off`: records `unchanged` without searching. This removes the news veto and
   is only for operators who review every candidate by hand.
+
+Exa (`POST https://api.exa.ai/search`, `x-api-key`) replaced Brave Search,
+which dropped its free API plan. One request per candidate asks for eight
+results with highlights for `<participant> <market slug> <sport> injury lineup
+suspension withdrawal weather schedule latest`; the highlights become the
+citation snippet, so the classifier and Bedrock read the actual roster or
+injury text rather than a search-result blurb. No published-date or category
+filter is sent: Exa excludes undated pages under a date filter, and the
+game-day injury tables (ESPN, FOX, StatMuse, CBS) carry no published date. The
+dated market slug in the query keeps results on the right game. Exa's
+`publishedDate` is accepted as RFC 3339 or `YYYY-MM-DD`; a citation without
+one is kept but cannot prove freshness.
 
 ## Odds Sources
 
@@ -340,5 +355,6 @@ outputs `application_secret_id`, `scanner_repository_url`, and `data_bucket`.
 - NFL tie and tennis walkover/withdrawal settlement profiles must be
   recognized or the market is excluded.
 
-No model output can create an actionable numeric edge. Bedrock can only
-preserve or downgrade a sportsbook-derived candidate.
+No reviewer output can create an actionable numeric edge. The keyword
+classifier and Bedrock can only preserve or downgrade a sportsbook-derived
+candidate.

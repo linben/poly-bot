@@ -58,9 +58,10 @@ reference book.
 
 ### News Can Veto, Not Invent
 
-Exa search and Bedrock may preserve or downgrade a sportsbook-derived
-candidate. An LLM cannot create a probability, increase position size, or turn
-a negative numeric edge into an actionable result.
+Exa search citations, whether classified by keyword or summarized by Bedrock,
+may preserve or downgrade a sportsbook-derived candidate. Neither the
+classifier nor an LLM can create a probability, increase position size, or
+turn a negative numeric edge into an actionable result.
 
 ### Small-Bankroll Discipline
 
