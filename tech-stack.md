@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Language | Rust 2024 edition, Rust 1.90+ | Scanner, terminal UI, source adapters, news worker, paper CLI |
 | Async runtime | Tokio | Concurrent HTTP collection and service execution |
-| HTTP client | Reqwest with rustls | Polymarket, source adapters, and Brave Search |
+| HTTP client | Reqwest with rustls | Polymarket, source adapters, and Exa search |
 | Terminal UI | ratatui + crossterm | Operator views over the local or cloud store |
 | Serialization | Serde and serde_json | Upstream normalization and persisted records |
 | Numeric model | rust_decimal | Odds, probabilities, fees, VWAP, and risk without floats |
@@ -21,14 +21,15 @@ unapproved sportsbook automation.
 ### Terminal UI
 
 `tui` renders with ratatui on a crossterm backend. The render loop draws on
-change, not on a fixed frame rate: `event::poll` waits up to 100 ms for a key,
-and a frame is redrawn only when the store or engine state changed or the 1 s
-clock ticked (scan age and countdown). The store is polled every 2 s in local
-mode and every 10 s in cloud mode. While the TUI owns the terminal, `tracing`
-output is captured into an in-memory ring buffer that feeds the LOG panels
-instead of being written to stderr. Views: Overview, Markets, Sources,
-Portfolio, System (`Tab` / `1`-`5`); Portfolio's `o`/`c` reuse the `paper
-open`/`close` rules.
+change, not on a fixed frame rate: crossterm's `EventStream`, the store
+snapshot channel, the engine status channel and a 1 s clock (scan age and
+countdown) are one `tokio::select!`, and a frame is redrawn only when one of
+them fires. The store is polled off the render loop every 2 s in local mode
+and every 10 s in cloud mode into an immutable snapshot. While the TUI owns the
+terminal, `tracing` output is captured into a 500-line in-memory ring buffer
+that feeds the LOG panels instead of being written to stderr. Views: Overview,
+Markets, Sources, Portfolio, System (`Tab` / `1`-`5`); `o` on Overview or
+Markets and `c` on Portfolio reuse the `paper open`/`close` rules.
 
 ## Run Modes
 
@@ -43,7 +44,7 @@ open`/`close` rules.
 | `news-worker` | n/a (the `local` news loop drains `news-queue.ndjson`) | SQS-triggered Lambda |
 | `paper`, `source-probe` | file store | AWS store |
 
-`news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Brave +
+`news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Exa +
 deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
 `DisabledReviewer`. `Store::take_news_queue` and `Store::prune` are the two
 local-only operations; the AWS store's defaults are no-ops because SQS and S3
@@ -68,8 +69,9 @@ The task:
 
 1. Acquires a DynamoDB lease.
 2. Discovers supported Polymarket US events.
-3. Collects the continuous source families concurrently (ESPN, Kalshi,
-   Polymarket global, and any approved direct adapters).
+3. Collects the continuous source families concurrently (Pinnacle, Action
+   Network book lines, ESPN, Kalshi, Polymarket global, Smarkets, and any
+   approved direct adapters).
 4. Builds preliminary consensus and opportunities.
 5. When a candidate survives, refetches up to three contributing continuous
    sources plus every confirmation-tier source for the candidate sports.
@@ -81,8 +83,11 @@ The task:
 ### Lambda
 
 One Rust Lambda function, `news-worker`, handles the event-driven work: it
-consumes SQS messages, calls Brave Search and Bedrock, and stores cited news
-evidence.
+consumes SQS messages, calls Exa search and Bedrock (`BedrockNewsEnricher`),
+and stores cited news evidence. It reads `BEDROCK_MODEL_ID` and, unless
+`EXA_API_KEY` is set directly, the `exa_api_key` field of the Secrets Manager
+secret named by `APP_SECRET_ID`. Records with evidence newer than
+`NEWS_REFRESH_SECONDS` are skipped without a search.
 
 The news worker returns partial batch failures so one bad record does not
 replay an entire successful SQS batch.
@@ -112,7 +117,7 @@ The state table uses `pk` and `sk` string keys. Main records include:
 | --- | --- | --- |
 | `LATEST` | `OPPORTUNITIES` | Latest recommendation collection |
 | `OPPORTUNITY#<uuid>` | timestamp | Historical opportunity |
-| `OPPORTUNITY#<uuid>` | `NEWS` | Brave/Bedrock evidence |
+| `OPPORTUNITY#<uuid>` | `NEWS` | Exa/Bedrock evidence |
 | `PORTFOLIO` | `PAPER` | Paper bankroll and open positions |
 | `LOCK#SCANNER` | `LEASE` | Scanner owner and expiry |
 
@@ -127,9 +132,10 @@ IDs and a one-hour evidence cache prevent duplicate five-minute search calls.
 
 ### Secrets Manager
 
-The application secret stores the Brave Search key. The news Lambda reads it
-at runtime. The Odds API key, when used, is supplied to the scanner task as
-`THE_ODDS_API_KEY`.
+The application secret is a JSON object. The news Lambda reads `exa_api_key`
+at runtime; the ECS task receives `the_odds_api_key` as `THE_ODDS_API_KEY`
+when `enable_the_odds_api` is set. Terraform creates the secret empty;
+`README.md` shows the `put-secret-value` call that populates it.
 
 ## External APIs
 
@@ -158,7 +164,7 @@ Every adapter implements `OddsSource` in `src/sources/` and emits
 
 | Tier | Adapters | Role |
 | --- | --- | --- |
-| Continuous | `EspnOddsSource`, `KalshiSource`, `PolymarketGlobalSource`, `CanonicalJsonSource` | Collected every scan for all sports; feed the preliminary consensus |
+| Continuous | `PinnacleSource` (reference), `ActionNetworkSource` (multi-book; `families()` lists every family it maps), `EspnOddsSource`, `KalshiSource`, `PolymarketGlobalSource`, `SmarketsSource`, `CanonicalJsonSource` | Collected every scan for all sports; feed the preliminary consensus |
 | Confirmation | `TheOddsApiSource` | Collected only for sports with a live candidate; bookmaker keys map onto owning families; stops at a credit floor |
 | Validation | none built in | `validation_only` quotes never enter consensus |
 
@@ -182,10 +188,36 @@ The scanner requires `MINIMUM_CONFIGURED_SOURCES` (default 3) distinct
 continuous families at startup and fails otherwise. A reference book and the
 five-family quorum are enforced per opportunity at runtime.
 
-### Brave Search and Bedrock
+### Exa Search and Bedrock
 
-Brave Search retrieves recent injury, lineup, suspension, withdrawal, weather,
-and schedule evidence. Bedrock runs an Anthropic-compatible request that must
+`news::ExaSearchClient` posts to `https://api.exa.ai/search` with the key in
+`x-api-key` and the request timeout of the calling process (the scanner's
+`request_timeout`, 15 s in the Lambda). Per candidate it sends one request:
+
+```json
+{
+  "query": "<participant> <market slug> <sport> injury lineup suspension withdrawal weather schedule latest",
+  "numResults": 8,
+  "moderation": true,
+  "contents": { "highlights": true }
+}
+```
+
+Each result becomes a `NewsCitation` (title, URL, published time, snippet).
+The snippet is the joined highlights, which is what gives the keyword
+classifier and Bedrock roster and injury text to work with. No
+`startPublishedDate` or `category` filter is sent: Exa excludes undated pages
+under a date filter, and game-day injury tables (ESPN, FOX, StatMuse, CBS)
+carry no published date; the dated market slug keeps results on the right
+game. `publishedDate` is parsed as RFC 3339 or `YYYY-MM-DD` because the docs
+and responses disagree. Exa replaced Brave Search when Brave dropped its free
+API plan; the client is the only place the provider is named, so swapping it
+again means one struct.
+
+`KeywordReviewer` classifies the citations deterministically (participant
+must be named; hard terms force `review`, soft terms `lower`, no citations
+`review`). `BedrockNewsEnricher` instead sends the numbered citations to an
+Anthropic-compatible Bedrock request (`temperature` 0, 500 tokens) that must
 return strict JSON:
 
 ```json
@@ -196,8 +228,10 @@ return strict JSON:
 }
 ```
 
-Allowed effects are `unchanged`, `lower`, `reject`, and `review`. Evidence
-older than two hours cannot preserve an actionable classification.
+Allowed effects are `unchanged`, `lower`, `reject`, and `review`; any other
+value is an error and the SQS record is retried. Zero citations short-circuit
+to `review` with manual review before the model is called. Evidence older than
+two hours cannot preserve an actionable classification.
 
 ## Domain Logic
 

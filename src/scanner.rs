@@ -61,7 +61,7 @@ impl Scanner {
             .collect::<Vec<_>>();
         let families = continuous
             .iter()
-            .map(|source| source.family())
+            .flat_map(|source| source.families())
             .collect::<HashSet<_>>();
         if families.len() < settings.minimum_configured_sources {
             return Err(crate::Error::Config(format!(
@@ -74,7 +74,7 @@ impl Scanner {
         let has_confirmation = sources.iter().any(|source| source.confirmation_only());
         if !has_confirmation && !families.iter().any(|family| family.is_reference()) {
             warn!(
-                "no reference book and no confirmation-tier source configured; results cannot exceed watchlist (set ENABLE_THE_ODDS_API=true and THE_ODDS_API_KEY)"
+                "no reference book configured; results cannot exceed watchlist (enable Pinnacle, or set ENABLE_THE_ODDS_API=true and THE_ODDS_API_KEY)"
             );
         }
         info!(
@@ -149,13 +149,8 @@ impl Scanner {
             let confirmation_sources = self.confirmation_sources(&preliminary);
             let (confirmation_quotes, confirmation_health) =
                 self.collect_sources(&confirmation_sources, &sports).await;
-            let mut merged_quotes = quotes;
-            merged_quotes.retain(|quote| {
-                !confirmation_sources
-                    .iter()
-                    .any(|source| quote_belongs_to(quote, source.as_ref()))
-            });
-            merged_quotes.extend(confirmation_quotes);
+            let merged_quotes =
+                merge_confirmation(quotes, confirmation_quotes, &confirmation_sources, &sports);
             let confirmed = self
                 .evaluate_markets(&markets, &merged_quotes, &portfolio, true)
                 .await;
@@ -371,6 +366,26 @@ fn quote_belongs_to(quote: &SourceQuote, source: &dyn OddsSource) -> bool {
     quote_id_belongs_to(&quote.source_id, source)
 }
 
+/// Replace a refetched source's quotes for the refetched sports with the
+/// fresh ones. Its quotes for other sports were not collected again and must
+/// survive; dropping them wholesale removed that family from every
+/// non-candidate sport the moment any candidate appeared.
+fn merge_confirmation(
+    mut quotes: Vec<SourceQuote>,
+    confirmation_quotes: Vec<SourceQuote>,
+    refetched: &[SharedSource],
+    sports: &[Sport],
+) -> Vec<SourceQuote> {
+    quotes.retain(|quote| {
+        !sports.contains(&quote.sport)
+            || !refetched
+                .iter()
+                .any(|source| quote_belongs_to(quote, source.as_ref()))
+    });
+    quotes.extend(confirmation_quotes);
+    quotes
+}
+
 fn deduplicate_health(health: &mut Vec<SourceHealth>) {
     health.sort_by(|left, right| {
         left.source_id
@@ -453,6 +468,53 @@ mod tests {
             book_time: Utc::now(),
             reasons: Vec::new(),
         }
+    }
+
+    fn quote(source_id: &str, sport: Sport, odds_a: i64) -> SourceQuote {
+        SourceQuote {
+            source_id: source_id.into(),
+            family: SourceFamily::Kalshi,
+            sport,
+            event_id: "event".into(),
+            participant_a: "A".into(),
+            participant_b: "B".into(),
+            participant_a_provider_ids: Default::default(),
+            participant_b_provider_ids: Default::default(),
+            start_time: Utc::now(),
+            start_time_tolerance_minutes: 15,
+            decimal_odds_a: Decimal::new(odds_a, 2),
+            decimal_odds_b: Decimal::new(200, 2),
+            decimal_odds_neutral: None,
+            source_timestamp: Utc::now(),
+            fetched_at: Utc::now(),
+            parser_version: "test".into(),
+            validation_only: false,
+        }
+    }
+
+    #[test]
+    fn confirmation_replaces_only_the_refetched_sports() {
+        let kalshi = source("kalshi", SourceFamily::Kalshi, false);
+        let initial = vec![
+            quote("kalshi", Sport::Nfl, 180),
+            quote("kalshi", Sport::Mlb, 180),
+            quote("espn:draftkings", Sport::Mlb, 180),
+        ];
+        let fresh = vec![quote("kalshi", Sport::Mlb, 190)];
+        let merged = merge_confirmation(initial, fresh, &[kalshi], &[Sport::Mlb]);
+        let mut seen = merged
+            .iter()
+            .map(|q| (q.source_id.as_str(), q.sport, q.decimal_odds_a))
+            .collect::<Vec<_>>();
+        seen.sort_by_key(|(id, sport, _)| (id.to_string(), format!("{sport:?}")));
+        assert_eq!(
+            seen,
+            vec![
+                ("espn:draftkings", Sport::Mlb, Decimal::new(180, 2)),
+                ("kalshi", Sport::Mlb, Decimal::new(190, 2)),
+                ("kalshi", Sport::Nfl, Decimal::new(180, 2)),
+            ]
+        );
     }
 
     #[test]

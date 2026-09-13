@@ -3,9 +3,10 @@
 Rust research and paper-risk tooling for pregame sports markets on the
 Polymarket US API. It scans NFL, NBA, WNBA, MLB, and tennis moneylines, compares
 the executable US order book with a de-vigged consensus built from free public
-odds sources (ESPN/DraftKings, Kalshi, Polymarket global) and an optional
-quota-limited multi-book confirmation feed, and enriches candidates with recent
-Brave Search evidence summarized by AWS Bedrock.
+odds sources (Pinnacle, Action Network's book lines, ESPN/DraftKings, Kalshi,
+Polymarket global, Smarkets) and an optional quota-limited confirmation feed,
+and enriches candidates with recent
+Exa search evidence summarized by AWS Bedrock.
 
 This repository does not contain wallet credentials, exchange authentication,
 or order-submission code. It cannot place a live trade.
@@ -20,10 +21,10 @@ architecture and technology choices are documented in
 - Markets: structured pregame full-game/match moneylines only
 - Contract acquisition price: `$0.35` through `$0.65`
 - Paper bankroll: `$100`
-- Position risk: quarter Kelly, bounded to 1-5% of bankroll
-- Watchlist: at least three independent source families
+- Position risk: quarter Kelly, bounded to 1-5% of bankroll (floor configurable)
+- Watchlist: at least three independent source families (configurable, >= 1)
 - Actionable consensus: at least five independent families, including a
-  reference book
+  reference book (both configurable)
 - Edge: at least five percentage points raw and three percentage points after
   dispersion and fees
 - Confirmation: when any candidate survives the continuous pass, refetch up to
@@ -32,10 +33,12 @@ architecture and technology choices are documented in
   fail closed if the quorum no longer holds
 - Freshness: a quote is fresh by when it was last observed, not by when the
   book last moved the line; an unmoved line is still a live price
-- News gate: a candidate remains watchlist until Bedrock returns corroborated
-  `unchanged` evidence; `lower`, `review`, and `reject` downgrade it
-- News cache: stable market-side IDs reuse evidence for one hour; evidence
-  older than two hours cannot preserve an actionable class
+- News gate: a candidate remains watchlist until the news reviewer returns
+  corroborated `unchanged` evidence; `lower`, `review`, and `reject` downgrade
+  it
+- News cache: stable market-side IDs reuse evidence for `NEWS_REFRESH_SECONDS`
+  (default 3600); evidence older than two hours cannot preserve an actionable
+  class
 
 Polymarket US exposes one YES book. The engine interprets:
 
@@ -53,21 +56,34 @@ the same scanner, consensus, sizing, and news logic.
 | | `local` (default) | `cloud` |
 | --- | --- | --- |
 | Process | one `local` binary: scan loop, news loop, retention, terminal UI | ECS one-shot `scanner`, Lambda `news-worker` |
-| Store | files under `data/` (`scans/`, `latest-opportunities.json`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
-| News reviewer | `keyword` (Brave + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
+| Store | files under `data/` (`scans/`, `latest-opportunities.json`, `latest-scan.json`, `opportunities.ndjson`, `news-queue.ndjson`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
+| News reviewer | `keyword` (Exa + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
 | Dashboard | terminal UI in-process, or `tui` attached to `data/` | `tui` with `RUN_MODE=cloud` and AWS credentials |
 | Requires | Rust toolchain, outbound HTTPS | AWS account, Terraform, Docker, cargo-lambda |
 
 ### Local mode
 
 ```bash
-cp .env.example .env            # optional: add THE_ODDS_API_KEY / BRAVE_SEARCH_API_KEY
+cp .env.example .env            # optional: add THE_ODDS_API_KEY / EXA_API_KEY
 set -a; source .env; set +a
 make local                      # or: cargo run --release --bin local
+make local-explore              # loosest gates, separate data-explore/ dir
 make local-once                 # one scan + one news pass, then exit
 make local-headless             # loops only, no terminal UI
 make tui                        # attach a viewer to data/ (or RUN_MODE=cloud)
 ```
+
+Every gate is an environment variable (see `.env.example`): `MINIMUM_RAW_EDGE`,
+`MINIMUM_NET_EDGE`, `MINIMUM_PRICE`/`MAXIMUM_PRICE`,
+`WATCHLIST_SOURCE_FAMILIES` (>= 1; a single family is one venue, not consensus), `MINIMUM_SOURCE_FAMILIES` (>= watchlist),
+`REQUIRE_REFERENCE_BOOK`, `MINIMUM_POSITION_FRACTION` (0 disables the size
+floor). The System view shows the values in force. `make local-explore` runs the
+loosest combination validation permits into `data-explore/`, so a quiet market
+still classifies rows; paper positions opened there are not comparable with the
+default policy. Under any policy the Overview table is never empty once a scan
+has run: with no live candidate it ranks every side by how close it is to the
+gates, and the `gap to gates` column names what each still needs (`edge
++4.3pp`, `fam +2`, `price`).
 
 `local` runs a fixed-cadence scan (`SCAN_INTERVAL_SECONDS`, default 300),
 drains the news queue every 20 s, prunes scan snapshots older than
@@ -100,7 +116,7 @@ credentials. There is no hosted web UI.
 
 | View | Shows | Keys |
 | --- | --- | --- |
-| Overview | status line (mode, phase, scan age and duration, counts, next scan); SCAN, SOURCES, EDGE & PAPER panels; CANDIDATES (live candidates first, then closest misses); LOG tail | `o` paper-open the top candidate, `r` rescan now (in-process) or reload (attached) |
+| Overview | status line (mode, phase, scan age and duration, counts, next scan); SCAN, SOURCES, EDGE & PAPER panels; CANDIDATES (live candidates first, then the rows nearest the gates: fewest failed gate categories, then largest net edge); LOG tail | `o` paper-open the top candidate, `r` rescan now (in-process) or reload (attached) |
 | Markets | every evaluated market side, with a DETAIL pane for the selected row (VWAP, maker price, size, fee, sources, news, every rejection reason) | `↑`/`↓` `j`/`k` `PgUp`/`PgDn` `g`/`G`, `s` sort (net edge / raw edge / families / class / sport), `f` cycle sport filter, `⏎` toggle detail, `o` paper-open selected |
 | Sources | reachability, quotes, latency per source; markets matched per source and sport | `r` rescan |
 | Portfolio | bankroll, exposure gauge, headroom; open paper positions with their current class | `↑`/`↓`, `c` close selected |
@@ -129,7 +145,7 @@ perform concurrent network collection without Lambda's packaging and duration
 constraints. A DynamoDB lease prevents overlapping scheduled tasks.
 
 Lambda is used only for the short, event-driven news work: SQS-triggered
-Brave Search and Bedrock enrichment.
+Exa search and Bedrock enrichment.
 
 S3 stores raw scans and quote snapshots. DynamoDB stores current
 recommendations, news evidence, paper portfolio state, and the scanner lease.
@@ -141,37 +157,60 @@ Operators inspect the cloud store with `RUN_MODE=cloud cargo run --features aws
 `NEWS_REVIEWER` picks how candidates are vetted. Every reviewer can only
 preserve or downgrade a candidate.
 
-- `keyword` (default when `BRAVE_SEARCH_API_KEY` is set): Brave Search, then a
+- `keyword` (default when `EXA_API_KEY` is set): Exa search, then a
   deterministic classifier. A citation counts only if it names the participant;
   hard terms (ruled out, scratched, suspended, withdrawn, postponed, ...) force
   `review` with manual review, soft terms (questionable, doubtful, injury,
   weather delay) give `lower`, otherwise `unchanged`. No citations at all is
   `review`.
-- `bedrock`: Brave Search summarized by Bedrock (build with `--features aws`).
-- none (default without a Brave key): no evidence is written, so nothing can
+- `bedrock`: the same Exa citations summarized by Bedrock (build with
+  `--features aws`; needs `BEDROCK_MODEL_ID` and AWS credentials).
+- none (default without an Exa key): no evidence is written, so nothing can
   leave the watchlist.
 - `off`: records `unchanged` without searching. This removes the news veto and
   is only for operators who review every candidate by hand.
 
+Exa (`POST https://api.exa.ai/search`, `x-api-key`) replaced Brave Search,
+which dropped its free API plan. One request per candidate asks for eight
+results with highlights for `<participant> <market slug> <sport> injury lineup
+suspension withdrawal weather schedule latest`; the highlights become the
+citation snippet, so the classifier and Bedrock read the actual roster or
+injury text rather than a search-result blurb. No published-date or category
+filter is sent: Exa excludes undated pages under a date filter, and the
+game-day injury tables (ESPN, FOX, StatMuse, CBS) carry no published date. The
+dated market slug in the query keeps results on the right game. Exa's
+`publishedDate` is accepted as RFC 3339 or `YYYY-MM-DD`; a citation without
+one is kept but cannot prove freshness.
+
 ## Odds Sources
 
-Three continuous sources run every scan. They are public, unauthenticated, and
-unmetered, and each is one independent family:
+Six continuous sources run every scan. They are public, unauthenticated, and
+unmetered; each is disabled with `ENABLE_<NAME>=false`:
 
-| Source | Family | Sports | Notes |
+| Source | Families | Sports | Notes |
 | --- | --- | --- | --- |
+| Pinnacle guest API | `pinnacle` (reference) | NFL, NBA, WNBA, MLB, tennis | The logged-out feed behind pinnacle.com; period-0 moneylines joined to pregame matchups; props, alternates and live matchups dropped. Makes the actionable quorum reachable |
+| Action Network scoreboard | `draft_kings`, `fan_duel`, `bet_mgm`, `caesars`, `bet365`, `kambi`, `fanatics`, ... | NFL, NBA, WNBA, MLB | One call per league returns each book's line with its own `inserted` timestamp; lines older than 48 h are dropped as stale openers. The API's book set varies call to call, so coverage per book fluctuates |
 | ESPN core odds | `draft_kings` (per provider ESPN serves) | NFL, NBA, WNBA, MLB | Current-week scoreboard only; American odds converted to decimal |
 | Kalshi public market API | `kalshi` | NFL, NBA, WNBA, MLB | `1 / yes ask` per side; skipped when spread > 6c; NFL/NBA rules carry only a date, so the quote uses a 14-hour start tolerance |
 | Polymarket global Gamma | `polymarket_global` | NFL, NBA, WNBA, MLB, tennis | `1 / ask` and `1 / (1 - bid)`; liquidity floor `POLYMARKET_GLOBAL_MIN_LIQUIDITY`, traded-volume floor `POLYMARKET_GLOBAL_MIN_VOLUME` (seeded, never-traded books sit at 50/50), spread <= 4c |
+| Smarkets exchange | `smarkets` | NFL, MLB, tennis (NBA/WNBA when listed) | Best offer per contract (`10000 / price`); markets with a > 10 pp spread, thin size or one empty side skipped. Quotes endpoint is limited to 20 requests/min, which one scan uses ~5 of |
 
-Three families reach the watchlist quorum, never the actionable one. The Odds
-API (`ENABLE_THE_ODDS_API=true` plus `THE_ODDS_API_KEY`) is the confirmation
-tier: it is only queried for sports that already have a candidate, one
-request per sport returns every US and EU book (Pinnacle, BetOnline, FanDuel,
-BetMGM, Caesars, ...), each mapped onto its owning family so skins are counted
-once, and it stops spending below `THE_ODDS_API_MIN_REMAINING` credits. On the
-free plan (500 credits/month, `us,eu` = 2 credits per sport) that is roughly
-four confirmations a day, which is plenty because candidates are rare.
+Skins of one operator collapse onto one family (DraftKings via ESPN and via
+Action Network is one vote), and the newest quote per family wins. With
+Pinnacle in the consensus a full-quorum side (five families plus the
+reference) is `actionable` when it clears the edge gates; measured on
+2026-09-12, 40 of 148 evaluated sides had 5-8 families.
+
+Probed and rejected from this host (US datacenter IP, no keys): DraftKings,
+Caesars, BetMGM and Circa direct APIs return 403; Bovada returns an empty
+body; BetOnline times out; Kambi's public CDN needs a customer key; FanDuel's
+content API works but adds nothing Action Network does not already carry;
+Novig has no public API. The Odds API (`ENABLE_THE_ODDS_API=true` plus
+`THE_ODDS_API_KEY`) remains available as a confirmation tier: it is only
+queried for sports that already have a candidate, one request per sport
+returns every US and EU book mapped onto its owning family, and it stops
+spending below `THE_ODDS_API_MIN_REMAINING` credits.
 
 `config/sources.json` still defines the direct book catalog. Set
 `SOURCE_<BOOK>_URL` to an approved adapter emitting the canonical JSON below
@@ -262,11 +301,11 @@ cargo run --bin paper -- close <opportunity-uuid>
 ```
 
 `cargo run --bin scanner` performs one scan and exits (the cloud task shape;
-`--continuous` loops). All binaries start with the three built-in public
-sources and fail at startup with fewer than three distinct continuous
-families (`MINIMUM_CONFIGURED_SOURCES`). Without a confirmation-tier source or
-a reference book they log a warning: results can reach the watchlist but never
-become actionable.
+`--continuous` loops). All binaries start with the six built-in public
+sources and fail at startup with fewer than `MINIMUM_CONFIGURED_SOURCES`
+distinct continuous families. Without a reference book (Pinnacle disabled and
+no confirmation tier) they log a warning: results can reach the watchlist but
+never become actionable.
 
 `source-probe` runs a real collection through every configured adapter and
 reports quote counts and latency; with `--adapters-only` it skips the catalog
@@ -278,7 +317,7 @@ homepage reachability checks. Logs go to stderr, JSON results to stdout.
 2. Build and push the scanner image using the immutable configured tag.
 3. Build the `news-worker` Lambda archive.
 4. Apply the complete Terraform stack.
-5. Put the Brave free-plan key in the generated secret.
+5. Put the Exa API key in the generated secret.
 
 ```bash
 cp infra/terraform.tfvars.example infra/terraform.tfvars
@@ -296,7 +335,7 @@ terraform -chdir=infra apply
 
 aws secretsmanager put-secret-value \
   --secret-id "$(terraform -chdir=infra output -raw application_secret_id)" \
-  --secret-string '{"brave_search_api_key":"replace-me","the_odds_api_key":"optional"}'
+  --secret-string '{"exa_api_key":"replace-me","the_odds_api_key":"optional"}'
 ```
 
 The Lambda zip path defaults to cargo-lambda's output under `target/lambda/`.
@@ -316,5 +355,6 @@ outputs `application_secret_id`, `scanner_repository_url`, and `data_bucket`.
 - NFL tie and tennis walkover/withdrawal settlement profiles must be
   recognized or the market is excluded.
 
-No model output can create an actionable numeric edge. Bedrock can only
-preserve or downgrade a sportsbook-derived candidate.
+No reviewer output can create an actionable numeric edge. The keyword
+classifier and Bedrock can only preserve or downgrade a sportsbook-derived
+candidate.

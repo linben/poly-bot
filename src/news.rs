@@ -23,15 +23,15 @@ pub trait NewsReviewer: Send + Sync {
 pub type SharedReviewer = Arc<dyn NewsReviewer>;
 
 /// Select the reviewer from `NEWS_REVIEWER`:
-/// - `keyword` (default when `BRAVE_SEARCH_API_KEY` is set): Brave Search plus
+/// - `keyword` (default when `EXA_API_KEY` is set): Exa search plus
 ///   a deterministic risk-term classifier; no model, runs anywhere.
-/// - `bedrock`: Brave Search summarized by Bedrock (needs the `aws` feature).
-/// - `none` (default without a Brave key): no evidence is produced, so
+/// - `bedrock`: Exa search summarized by Bedrock (needs the `aws` feature).
+/// - `none` (default without an Exa key): no evidence is produced, so
 ///   candidates stay on the watchlist.
 /// - `off`: records `unchanged` without searching. Removes the news veto;
 ///   only for operators who review candidates by hand.
 pub async fn reviewer_from_env(timeout: Duration) -> Result<Option<SharedReviewer>> {
-    let brave_key = std::env::var("BRAVE_SEARCH_API_KEY")
+    let exa_key = std::env::var("EXA_API_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let requested = std::env::var("NEWS_REVIEWER")
@@ -39,7 +39,7 @@ pub async fn reviewer_from_env(timeout: Duration) -> Result<Option<SharedReviewe
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            if brave_key.is_some() {
+            if exa_key.is_some() {
                 "keyword".into()
             } else {
                 "none".into()
@@ -49,12 +49,12 @@ pub async fn reviewer_from_env(timeout: Duration) -> Result<Option<SharedReviewe
         "none" => Ok(None),
         "off" => Ok(Some(Arc::new(DisabledReviewer))),
         "keyword" => {
-            let key = brave_key.ok_or_else(|| {
-                Error::Config("NEWS_REVIEWER=keyword requires BRAVE_SEARCH_API_KEY".into())
+            let key = exa_key.ok_or_else(|| {
+                Error::Config("NEWS_REVIEWER=keyword requires EXA_API_KEY".into())
             })?;
-            Ok(Some(Arc::new(KeywordReviewer::new(
-                BraveSearchClient::new(key, timeout)?,
-            ))))
+            Ok(Some(Arc::new(KeywordReviewer::new(ExaSearchClient::new(
+                key, timeout,
+            )?))))
         }
         #[cfg(feature = "aws")]
         "bedrock" => Ok(Some(Arc::new(BedrockNewsEnricher::from_env().await?))),
@@ -136,15 +136,15 @@ impl NewsReviewer for DisabledReviewer {
     }
 }
 
-/// Brave Search plus a deterministic classifier. A citation counts against the
+/// Exa search plus a deterministic classifier. A citation counts against the
 /// candidate only when it names the participant and carries a risk term, so
 /// generic injury coverage of other teams does not downgrade every candidate.
 pub struct KeywordReviewer {
-    search: BraveSearchClient,
+    search: ExaSearchClient,
 }
 
 impl KeywordReviewer {
-    pub fn new(search: BraveSearchClient) -> Self {
+    pub fn new(search: ExaSearchClient) -> Self {
         Self { search }
     }
 }
@@ -266,22 +266,20 @@ fn participant_terms(participant: &str) -> Vec<String> {
     terms
 }
 
-pub struct BraveSearchClient {
-    api_key: String,
+pub struct ExaSearchClient {
     client: reqwest::Client,
 }
 
-impl BraveSearchClient {
+impl ExaSearchClient {
     pub fn new(api_key: String, timeout: Duration) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
-            "X-Subscription-Token",
+            "x-api-key",
             HeaderValue::from_str(&api_key)
-                .map_err(|error| Error::Config(format!("BRAVE_SEARCH_API_KEY: {error}")))?,
+                .map_err(|error| Error::Config(format!("EXA_API_KEY: {error}")))?,
         );
         Ok(Self {
-            api_key,
             client: reqwest::Client::builder()
                 .timeout(timeout)
                 .default_headers(headers)
@@ -290,71 +288,80 @@ impl BraveSearchClient {
         })
     }
 
+    /// No `startPublishedDate`/`category` filters: Exa drops undated pages
+    /// under a date filter, and the game-day injury tables (ESPN, FOX,
+    /// StatMuse, CBS) carry no published date. The dated market slug in the
+    /// query keeps results on the right game.
     pub async fn search(&self, opportunity: &Opportunity) -> Result<Vec<NewsCitation>> {
-        if self.api_key.is_empty() {
-            return Ok(Vec::new());
-        }
         let query = format!(
             "{} {} {} injury lineup suspension withdrawal weather schedule latest",
             opportunity.participant, opportunity.market_slug, opportunity.sport
         );
-        let payload: BraveResponse = self
+        let payload: ExaResponse = self
             .client
-            .get("https://api.search.brave.com/res/v1/web/search")
-            .query(&[
-                ("q", query.as_str()),
-                ("count", "8"),
-                ("freshness", "pd"),
-                ("safesearch", "moderate"),
-            ])
+            .post("https://api.exa.ai/search")
+            .json(&serde_json::json!({
+                "query": query,
+                "numResults": 8,
+                "moderation": true,
+                "contents": { "highlights": true },
+            }))
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
         Ok(payload
-            .web
-            .map(|web| web.results)
-            .unwrap_or_default()
+            .results
             .into_iter()
             .map(|result| NewsCitation {
-                title: result.title,
+                title: result.title.unwrap_or_default(),
                 url: result.url,
                 published_at: result
-                    .page_age
+                    .published_date
                     .as_deref()
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                    .map(|value| value.with_timezone(&Utc)),
-                snippet: result.description.unwrap_or_default(),
+                    .and_then(parse_published_date),
+                snippet: result.highlights.join(" "),
             })
             .collect())
     }
 }
 
-#[derive(Deserialize)]
-struct BraveResponse {
-    web: Option<BraveWeb>,
+/// Exa documents `publishedDate` as `YYYY-MM-DD` but returns RFC 3339 in
+/// practice; accept both.
+fn parse_published_date(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|naive| naive.and_utc())
+        })
 }
 
 #[derive(Deserialize)]
-struct BraveWeb {
+struct ExaResponse {
     #[serde(default)]
-    results: Vec<BraveResult>,
+    results: Vec<ExaResult>,
 }
 
 #[derive(Deserialize)]
-struct BraveResult {
-    title: String,
+#[serde(rename_all = "camelCase")]
+struct ExaResult {
+    title: Option<String>,
     url: String,
-    description: Option<String>,
-    page_age: Option<String>,
+    published_date: Option<String>,
+    #[serde(default)]
+    highlights: Vec<String>,
 }
 
 #[cfg(feature = "aws")]
 pub struct BedrockNewsEnricher {
     model_id: String,
     client: aws_sdk_bedrockruntime::Client,
-    search: BraveSearchClient,
+    search: ExaSearchClient,
 }
 
 #[cfg(feature = "aws")]
@@ -363,11 +370,11 @@ impl BedrockNewsEnricher {
         let model_id = std::env::var("BEDROCK_MODEL_ID")
             .map_err(|_| Error::Config("BEDROCK_MODEL_ID is required".into()))?;
         let config = aws_config::load_from_env().await;
-        let api_key = match std::env::var("BRAVE_SEARCH_API_KEY") {
+        let api_key = match std::env::var("EXA_API_KEY") {
             Ok(value) if !value.trim().is_empty() => value,
             _ => {
                 let secret_id = std::env::var("APP_SECRET_ID").map_err(|_| {
-                    Error::Config("BRAVE_SEARCH_API_KEY or APP_SECRET_ID is required".into())
+                    Error::Config("EXA_API_KEY or APP_SECRET_ID is required".into())
                 })?;
                 let response = aws_sdk_secretsmanager::Client::new(&config)
                     .get_secret_value()
@@ -380,19 +387,17 @@ impl BedrockNewsEnricher {
                         Error::Config("application secret has no string value".into())
                     })?)?;
                 secret
-                    .get("brave_search_api_key")
+                    .get("exa_api_key")
                     .and_then(serde_json::Value::as_str)
                     .filter(|value| !value.trim().is_empty())
                     .map(str::to_string)
-                    .ok_or_else(|| {
-                        Error::Config("application secret has no brave_search_api_key".into())
-                    })?
+                    .ok_or_else(|| Error::Config("application secret has no exa_api_key".into()))?
             }
         };
         Ok(Self {
             model_id,
             client: aws_sdk_bedrockruntime::Client::new(&config),
-            search: BraveSearchClient::new(api_key, Duration::from_secs(15))?,
+            search: ExaSearchClient::new(api_key, Duration::from_secs(15))?,
         })
     }
 
@@ -581,6 +586,34 @@ mod tests {
         );
         assert_eq!(evidence.confidence_effect, "lower");
         assert!(!evidence.manual_review);
+    }
+
+    #[test]
+    fn published_date_accepts_rfc3339_and_date_only() {
+        assert_eq!(
+            parse_published_date("2023-11-16T01:36:32.547Z").map(|value| value.to_rfc3339()),
+            Some("2023-11-16T01:36:32.547+00:00".into())
+        );
+        assert_eq!(
+            parse_published_date("2023-11-16").map(|value| value.to_rfc3339()),
+            Some("2023-11-16T00:00:00+00:00".into())
+        );
+        assert_eq!(parse_published_date("yesterday"), None);
+    }
+
+    #[test]
+    fn exa_results_tolerate_null_title_and_missing_highlights() {
+        let payload: ExaResponse = serde_json::from_str(
+            r#"{"requestId":"x","results":[
+                {"title":null,"url":"https://a.example","publishedDate":"2023-11-16"},
+                {"title":"Ravens","url":"https://b.example","highlights":["a","b"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.results.len(), 2);
+        assert!(payload.results[0].title.is_none());
+        assert!(payload.results[0].highlights.is_empty());
+        assert_eq!(payload.results[1].highlights.join(" "), "a b");
     }
 
     #[tokio::test]

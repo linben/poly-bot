@@ -58,9 +58,10 @@ reference book.
 
 ### News Can Veto, Not Invent
 
-Brave Search and Bedrock may preserve or downgrade a sportsbook-derived
-candidate. An LLM cannot create a probability, increase position size, or turn
-a negative numeric edge into an actionable result.
+Exa search citations, whether classified by keyword or summarized by Bedrock,
+may preserve or downgrade a sportsbook-derived candidate. Neither the
+classifier nor an LLM can create a probability, increase position size, or
+turn a negative numeric edge into an actionable result.
 
 ### Small-Bankroll Discipline
 
@@ -78,13 +79,14 @@ and news citations are retained so a recommendation can be reconstructed.
 - Polymarket US public API
 - Pregame full-game or match moneylines
 - NFL, NBA, WNBA, MLB, and tennis
-- Three free public continuous source families every five minutes (ESPN
-  odds, Kalshi, Polymarket global), plus a quota-limited multi-book
-  confirmation pass and any approved direct sportsbook adapters
+- Free public continuous sources every five minutes (Pinnacle as the
+  reference book, Action Network's per-book lines, ESPN odds, Kalshi,
+  Polymarket global, Smarkets), plus a quota-limited multi-book confirmation
+  pass and any approved direct sportsbook adapters
 - Proportional de-vigging and robust median/MAD consensus
 - Provider-ID-first event matching
 - Multi-level YES and opposing-outcome execution pricing
-- Brave Search and Bedrock news review
+- Exa search and Bedrock news review
 - Explicit paper position open and close workflow
 - Terminal UI over the local or cloud store
 

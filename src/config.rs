@@ -53,8 +53,16 @@ pub struct Settings {
     pub minimum_price: Decimal,
     pub maximum_price: Decimal,
     pub bankroll: Decimal,
+    /// A side whose quarter-Kelly size or depth-limited maximum loss is below
+    /// this fraction of bankroll is rejected as too small to matter. Zero
+    /// disables the floor (exploration).
+    pub minimum_position_fraction: Decimal,
     pub maximum_position_fraction: Decimal,
     pub maximum_total_exposure: Decimal,
+    /// Actionable requires a reference sportsbook (Pinnacle-class) in the
+    /// consensus. Only the confirmation tier supplies one; switching this off
+    /// lets a full free-source quorum reach actionable.
+    pub require_reference_book: bool,
     pub kelly_fraction: Decimal,
     pub source_config_path: String,
 }
@@ -82,7 +90,9 @@ impl Default for Settings {
             minimum_price: Decimal::new(35, 2),
             maximum_price: Decimal::new(65, 2),
             bankroll: Decimal::ONE_HUNDRED,
+            minimum_position_fraction: Decimal::new(1, 2),
             maximum_position_fraction: Decimal::new(5, 2),
+            require_reference_book: true,
             maximum_total_exposure: Decimal::new(5, 0),
             kelly_fraction: Decimal::new(25, 2),
             source_config_path: "config/sources.json".into(),
@@ -123,7 +133,15 @@ impl Settings {
         )?;
         settings.minimum_raw_edge = parse_env("MINIMUM_RAW_EDGE", settings.minimum_raw_edge)?;
         settings.minimum_net_edge = parse_env("MINIMUM_NET_EDGE", settings.minimum_net_edge)?;
+        settings.minimum_price = parse_env("MINIMUM_PRICE", settings.minimum_price)?;
+        settings.maximum_price = parse_env("MAXIMUM_PRICE", settings.maximum_price)?;
+        settings.require_reference_book =
+            parse_env("REQUIRE_REFERENCE_BOOK", settings.require_reference_book)?;
         settings.bankroll = parse_env("PAPER_BANKROLL", settings.bankroll)?;
+        settings.minimum_position_fraction = parse_env(
+            "MINIMUM_POSITION_FRACTION",
+            settings.minimum_position_fraction,
+        )?;
         settings.maximum_position_fraction = parse_env(
             "MAXIMUM_POSITION_FRACTION",
             settings.maximum_position_fraction,
@@ -145,13 +163,12 @@ impl Settings {
                 "scan timing, request timeout, and concurrency must be positive".into(),
             ));
         }
-        if self.watchlist_source_families < 3
-            || self.minimum_source_families < 5
+        if self.watchlist_source_families < 1
             || self.minimum_source_families < self.watchlist_source_families
             || self.minimum_configured_sources < self.watchlist_source_families
         {
             return Err(Error::Config(
-                "source-family quorum must be at least 3 watchlist and 5 actionable, with at least 3 configured continuous families".into(),
+                "source-family quorum must be at least 1 watchlist, actionable at least watchlist, with at least that many configured continuous families".into(),
             ));
         }
         if self.minimum_price <= Decimal::ZERO
@@ -163,6 +180,8 @@ impl Settings {
         if self.bankroll <= Decimal::ZERO
             || self.maximum_position_fraction < Decimal::new(1, 2)
             || self.maximum_position_fraction > Decimal::new(5, 2)
+            || self.minimum_position_fraction < Decimal::ZERO
+            || self.minimum_position_fraction > self.maximum_position_fraction
             || self.maximum_total_exposure <= Decimal::ZERO
             || self.maximum_total_exposure > Decimal::new(5, 0)
             || self.maximum_total_exposure > self.bankroll

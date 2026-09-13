@@ -1,8 +1,11 @@
+mod action_network;
 mod canonical;
 mod catalog;
 mod espn;
 mod kalshi;
+mod pinnacle;
 mod polymarket_global;
+mod smarkets;
 mod the_odds_api;
 
 use std::{sync::Arc, time::Duration, time::Instant};
@@ -15,11 +18,14 @@ use crate::{
     domain::{SourceFamily, SourceHealth, SourceQuote, Sport},
 };
 
+pub use action_network::ActionNetworkSource;
 pub use canonical::CanonicalJsonSource;
 pub use catalog::{SourceCatalog, SourceSpec, SourceTier};
 pub use espn::EspnOddsSource;
 pub use kalshi::KalshiSource;
+pub use pinnacle::PinnacleSource;
 pub use polymarket_global::PolymarketGlobalSource;
+pub use smarkets::SmarketsSource;
 pub use the_odds_api::TheOddsApiSource;
 
 /// Identifying user agent with a contact URL. Some public sports APIs reject
@@ -38,6 +44,12 @@ pub fn http_client(timeout: Duration) -> Result<reqwest::Client> {
 pub trait OddsSource: Send + Sync {
     fn id(&self) -> &str;
     fn family(&self) -> SourceFamily;
+    /// Every family this adapter can emit. Aggregators that carry several
+    /// books return all of them so the startup quorum counts what the scan
+    /// will actually see; single-book adapters keep the default.
+    fn families(&self) -> Vec<SourceFamily> {
+        vec![self.family()]
+    }
     /// Quotes never enter consensus; kept for side-by-side comparison only.
     fn validation_only(&self) -> bool {
         false
