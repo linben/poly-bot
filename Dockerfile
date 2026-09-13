@@ -1,8 +1,9 @@
 FROM rust:1.96-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
-COPY web ./web
+# The build script reads the git commit for health.json; without .git in the
+# image context it records `unknown`, which is correct for an image build.
 RUN cargo build --release --features aws --bin scanner
 
 FROM debian:bookworm-slim

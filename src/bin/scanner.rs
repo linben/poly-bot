@@ -1,7 +1,12 @@
 //! One-shot scan (the cloud ECS task) or a resilient continuous loop.
 
 use clap::Parser;
-use polybot::{Result, config::Settings, scanner::Scanner, storage::store_for};
+use polybot::{
+    Result,
+    config::Settings,
+    scanner::Scanner,
+    storage::{Archive, store_for},
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -17,7 +22,7 @@ async fn main() -> Result<()> {
     polybot::init_tracing();
     let args = Args::parse();
     let settings = Settings::from_env()?;
-    let store = store_for(settings.run_mode, &args.data_dir).await?;
+    let store = store_for(&settings, &args.data_dir, Archive::Enabled).await?;
     let scanner = Scanner::from_settings(settings.clone(), store)?;
 
     if !args.continuous {

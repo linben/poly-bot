@@ -9,7 +9,7 @@ use ratatui::{
 
 use super::{App, View, widgets::*};
 use crate::{
-    domain::{RecommendationClass, ResearchOpportunity, Sport},
+    domain::{PaperPosition, RecommendationClass, ResearchOpportunity, Sport},
     tui::{
         data::{GateGap, decimal_f64},
         feed::Phase,
@@ -577,6 +577,11 @@ fn render_market_detail(frame: &mut Frame<'_>, area: Rect, row: &ResearchOpportu
                     .map(|value| price(decimal_f64(value)))
                     .unwrap_or_else(|| "-".into()),
             ),
+            sep(),
+            label("maker edge"),
+            o.maker_net_edge
+                .map(|value| signed_pp(decimal_f64(value)))
+                .unwrap_or_else(|| muted("-")),
         ]),
         Line::from(vec![
             label("quantity"),
@@ -702,8 +707,19 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let portfolio = &app.store.portfolio;
     let exposure = decimal_f64(portfolio.open_exposure);
     let cap = decimal_f64(app.settings.maximum_total_exposure);
-    let [summary_area, table_area] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(4)]).areas(area);
+    let realized = decimal_f64(portfolio.realized_pnl);
+    // Closed positions take the rows they need (up to eight) below the open
+    // book; the open book keeps the rest.
+    let closed_height = match portfolio.closed_positions.len() {
+        0 => 0,
+        count => count.min(8) as u16 + 2,
+    };
+    let [summary_area, open_area, closed_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(4),
+        Constraint::Length(closed_height),
+    ])
+    .areas(area);
     let inner = section(frame, summary_area, "PAPER PORTFOLIO", Vec::new());
     let mut gauge_spans = vec![
         label("exposure"),
@@ -719,11 +735,21 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Tone::Good
         },
     ));
+    gauge_spans.extend([
+        sep(),
+        label("realized"),
+        signed_usd(realized),
+        muted(format!(" over {} closed", portfolio.closed_positions.len())),
+    ]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
                 label("bankroll"),
                 plain(usd(decimal_f64(portfolio.bankroll))),
+                muted(format!(
+                    " (base {})",
+                    usd(decimal_f64(app.settings.bankroll))
+                )),
                 sep(),
                 label("position risk"),
                 plain(format!(
@@ -739,9 +765,17 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
         inner,
     );
 
+    render_open_positions(frame, open_area, app);
+    if closed_height > 0 {
+        render_closed_positions(frame, closed_area, app);
+    }
+}
+
+fn render_open_positions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let portfolio = &app.store.portfolio;
     let inner = section(
         frame,
-        table_area,
+        area,
         "OPEN POSITIONS",
         vec![muted(format!("{}", portfolio.open_positions.len()))],
     );
@@ -775,13 +809,17 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         Tone::for_class(row.effective_class),
                     ),
                 ),
-                None => (position.market_id.clone(), muted("not in latest scan")),
+                None => (position_name(position), muted("not in latest scan")),
             };
             let mut row = Row::new(vec![
                 Cell::from(clock(position.opened_at)),
                 Cell::from(fit(&participant, 26)),
                 Cell::from(format!("{:?}", position.side).to_ascii_lowercase()),
+                Cell::from(right(format!("{}", position.quantity.round_dp(2)))),
+                Cell::from(right(price(decimal_f64(position.entry_price)))),
                 Cell::from(right(usd(decimal_f64(position.maximum_loss)))),
+                Cell::from(closing_cell(position)),
+                Cell::from(clv_cell(position)),
                 Cell::from(status),
                 Cell::from(muted(position.opportunity_id.to_string())),
             ]);
@@ -796,6 +834,10 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(8),
             Constraint::Length(26),
             Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(12),
             Constraint::Min(36),
@@ -806,7 +848,11 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "opened",
             "participant",
             "side",
+            "qty",
+            "entry",
             "max loss",
+            "closing",
+            "clv",
             "now",
             "opportunity",
         ])
@@ -814,6 +860,100 @@ fn render_portfolio(frame: &mut Frame<'_>, area: Rect, app: &App) {
     )
     .column_spacing(1);
     frame.render_widget(table, inner);
+}
+
+/// Settled and manually closed positions, newest first.
+fn render_closed_positions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let portfolio = &app.store.portfolio;
+    let inner = section(
+        frame,
+        area,
+        "CLOSED POSITIONS",
+        vec![
+            muted(format!("{}", portfolio.closed_positions.len())),
+            sep(),
+            label("realized"),
+            signed_usd(decimal_f64(portfolio.realized_pnl)),
+        ],
+    );
+    let rows = portfolio.closed_positions.iter().rev().map(|position| {
+        let result = match position.realized_pnl {
+            Some(pnl) => Line::from(signed_usd(decimal_f64(pnl))).alignment(Alignment::Right),
+            None => Line::from(muted("closed by hand")).alignment(Alignment::Right),
+        };
+        let payout = position
+            .settlement_payout
+            .map(|value| price(decimal_f64(value)))
+            .unwrap_or_else(|| "-".into());
+        Row::new(vec![
+            Cell::from(clock(position.closed_at.unwrap_or(position.opened_at))),
+            Cell::from(fit(&position_name(position), 26)),
+            Cell::from(format!("{:?}", position.side).to_ascii_lowercase()),
+            Cell::from(right(format!("{}", position.quantity.round_dp(2)))),
+            Cell::from(right(price(decimal_f64(position.entry_price)))),
+            Cell::from(closing_cell(position)),
+            Cell::from(clv_cell(position)),
+            Cell::from(right(payout)),
+            Cell::from(result),
+            Cell::from(muted(position.opportunity_id.to_string())),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(26),
+            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(14),
+            Constraint::Min(36),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "closed",
+            "market",
+            "side",
+            "qty",
+            "entry",
+            "closing",
+            "clv",
+            "payout",
+            "p&l",
+            "opportunity",
+        ])
+        .style(Tone::Muted.style()),
+    )
+    .column_spacing(1);
+    frame.render_widget(table, inner);
+}
+
+/// Market slug when the position recorded one, else the market id.
+fn position_name(position: &PaperPosition) -> String {
+    if position.market_slug.is_empty() {
+        position.market_id.clone()
+    } else {
+        position.market_slug.clone()
+    }
+}
+
+fn closing_cell(position: &PaperPosition) -> Line<'static> {
+    match position.closing_price {
+        Some(closing) => right(price(decimal_f64(closing))),
+        None => Line::from(muted("-")).alignment(Alignment::Right),
+    }
+}
+
+/// Closing-line value: positive when the entry beat the venue's pre-start price.
+fn clv_cell(position: &PaperPosition) -> Line<'static> {
+    match position.closing_line_value() {
+        Some(clv) => Line::from(signed_pp(decimal_f64(clv))).alignment(Alignment::Right),
+        None => Line::from(muted("-")).alignment(Alignment::Right),
+    }
 }
 
 // ---------------------------------------------------------------- system

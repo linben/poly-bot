@@ -172,14 +172,15 @@ pub struct ConsensusPrice {
     pub probability_neutral: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub dispersion_a: Decimal,
-    pub source_count: usize,
+    /// Independent source families that survived the outlier filter; one
+    /// quote per family, so this is also the quote count.
     pub family_count: usize,
     pub has_reference: bool,
     pub source_ids: Vec<String>,
     pub newest_source_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeSide {
     Long,
@@ -259,12 +260,21 @@ pub struct Opportunity {
     pub side: OutcomeSide,
     #[serde(with = "rust_decimal::serde::str")]
     pub fair_probability: Decimal,
+    /// `fair` less the consensus dispersion and the configured consensus bias;
+    /// the probability every sizing and net-edge decision uses.
     #[serde(with = "rust_decimal::serde::str")]
     pub conservative_probability: Decimal,
+    /// Depth-weighted taker price (VWAP) for the sized quantity.
     #[serde(with = "rust_decimal::serde::str")]
     pub executable_price: Decimal,
+    /// Side price of a resting order one tick inside the spread, if the spread
+    /// leaves room for one. Informational: a maker fill is not guaranteed.
     #[serde(default, with = "rust_decimal::serde::str_option")]
     pub maker_price: Option<Decimal>,
+    /// `conservative - maker_price + maker rebate`; what the same edge is
+    /// worth if the order rests instead of crossing. Never classifies a row.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub maker_net_edge: Option<Decimal>,
     #[serde(with = "rust_decimal::serde::str")]
     pub raw_edge: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -275,7 +285,6 @@ pub struct Opportunity {
     pub maximum_loss: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub estimated_fee: Decimal,
-    pub source_count: usize,
     pub family_count: usize,
     pub source_ids: Vec<String>,
     /// Scheduled start of the underlying game or match.
@@ -286,22 +295,100 @@ pub struct Opportunity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperPortfolio {
+    /// Sizing base plus realized P&L; the store recomputes it on load.
     #[serde(with = "rust_decimal::serde::str")]
     pub bankroll: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub open_exposure: Decimal,
     pub open_positions: Vec<PaperPosition>,
+    /// Settled or manually closed positions, oldest first.
+    #[serde(default)]
+    pub closed_positions: Vec<PaperPosition>,
+    /// Sum of `realized_pnl` over `closed_positions`.
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub realized_pnl: Decimal,
 }
 
+impl PaperPortfolio {
+    pub fn new(bankroll: Decimal) -> Self {
+        Self {
+            bankroll,
+            open_exposure: Decimal::ZERO,
+            open_positions: Vec::new(),
+            closed_positions: Vec::new(),
+            realized_pnl: Decimal::ZERO,
+        }
+    }
+}
+
+/// A paper position records enough at open to be settled and graded later:
+/// entry price and quantity for P&L, fair probability for calibration, and the
+/// venue's pre-start closing price for closing-line value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperPosition {
     pub opportunity_id: Uuid,
     pub event_id: String,
     pub market_id: String,
+    #[serde(default)]
+    pub market_slug: String,
     pub side: OutcomeSide,
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    /// Depth-weighted side price paid per contract (taker).
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub entry_price: Decimal,
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub fair_probability: Decimal,
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub estimated_fee: Decimal,
+    /// Gross cost plus fee; what the portfolio holds as exposure.
     #[serde(with = "rust_decimal::serde::str")]
     pub maximum_loss: Decimal,
+    #[serde(default)]
+    pub start_time: Option<DateTime<Utc>>,
     pub opened_at: DateTime<Utc>,
+    /// Venue side price at (or just before) scheduled start; `entry_price`
+    /// below this is positive closing-line value.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub closing_price: Option<Decimal>,
+    /// Side payout per contract at settlement (`settlement` for long,
+    /// `1 - settlement` for short).
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub settlement_payout: Option<Decimal>,
+    /// `quantity * (settlement_payout - entry_price) - estimated_fee`.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub realized_pnl: Option<Decimal>,
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+impl PaperPosition {
+    pub fn from_opportunity(opportunity: &Opportunity, opened_at: DateTime<Utc>) -> Self {
+        Self {
+            opportunity_id: opportunity.id,
+            event_id: opportunity.event_id.clone(),
+            market_id: opportunity.market_id.clone(),
+            market_slug: opportunity.market_slug.clone(),
+            side: opportunity.side,
+            quantity: opportunity.quantity,
+            entry_price: opportunity.executable_price,
+            fair_probability: opportunity.fair_probability,
+            estimated_fee: opportunity.estimated_fee,
+            maximum_loss: opportunity.maximum_loss,
+            start_time: Some(opportunity.start_time),
+            opened_at,
+            closing_price: None,
+            settlement_payout: None,
+            realized_pnl: None,
+            closed_at: None,
+        }
+    }
+
+    /// Closing-line value in side-price points: positive when the entry was
+    /// cheaper than the venue's price at start.
+    pub fn closing_line_value(&self) -> Option<Decimal> {
+        self.closing_price.map(|closing| closing - self.entry_price)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +430,13 @@ pub struct ResearchOpportunity {
 
 impl ResearchOpportunity {
     pub fn new(opportunity: Opportunity, news: Option<NewsEvidence>) -> Self {
-        let effective_class = effective_recommendation(opportunity.class, news.as_ref());
+        Self::at(opportunity, news, Utc::now())
+    }
+
+    /// `now` bounds news freshness: evidence older than two hours cannot
+    /// preserve an actionable class.
+    pub fn at(opportunity: Opportunity, news: Option<NewsEvidence>, now: DateTime<Utc>) -> Self {
+        let effective_class = effective_recommendation(opportunity.class, news.as_ref(), now);
         Self {
             opportunity,
             effective_class,
@@ -355,10 +448,11 @@ impl ResearchOpportunity {
 fn effective_recommendation(
     recommendation: RecommendationClass,
     news: Option<&NewsEvidence>,
+    now: DateTime<Utc>,
 ) -> RecommendationClass {
     let fresh_news = news.filter(|evidence| {
-        evidence.generated_at >= Utc::now() - chrono::Duration::hours(2)
-            && evidence.generated_at <= Utc::now() + chrono::Duration::minutes(1)
+        evidence.generated_at >= now - chrono::Duration::hours(2)
+            && evidence.generated_at <= now + chrono::Duration::minutes(1)
     });
     match (recommendation, fresh_news) {
         (RecommendationClass::Rejected, _) => RecommendationClass::Rejected,
@@ -393,35 +487,39 @@ mod tests {
 
     #[test]
     fn actionable_requires_completed_unchanged_news() {
+        let now = Utc::now();
         assert_eq!(
-            effective_recommendation(RecommendationClass::Actionable, None),
+            effective_recommendation(RecommendationClass::Actionable, None, now),
             RecommendationClass::Watchlist
         );
         assert_eq!(
             effective_recommendation(
                 RecommendationClass::Actionable,
-                Some(&evidence("unchanged", false))
+                Some(&evidence("unchanged", false)),
+                now
             ),
             RecommendationClass::Actionable
         );
         assert_eq!(
             effective_recommendation(
                 RecommendationClass::Actionable,
-                Some(&evidence("lower", false))
+                Some(&evidence("lower", false)),
+                now
             ),
             RecommendationClass::Watchlist
         );
         assert_eq!(
             effective_recommendation(
                 RecommendationClass::Actionable,
-                Some(&evidence("reject", false))
+                Some(&evidence("reject", false)),
+                now
             ),
             RecommendationClass::Rejected
         );
         let mut stale = evidence("unchanged", false);
-        stale.generated_at = Utc::now() - chrono::Duration::hours(3);
+        stale.generated_at = now - chrono::Duration::hours(3);
         assert_eq!(
-            effective_recommendation(RecommendationClass::Actionable, Some(&stale)),
+            effective_recommendation(RecommendationClass::Actionable, Some(&stale), now),
             RecommendationClass::Watchlist
         );
     }
@@ -431,11 +529,31 @@ mod tests {
 pub struct ScanSnapshot {
     pub scan_id: Uuid,
     pub started_at: DateTime<Utc>,
+    /// The `now` every freshness, lead, and news check in this scan used.
+    /// Replays evaluate stored inputs at this instant. Snapshots written
+    /// before this field existed read as the Unix epoch; see
+    /// [`ScanSnapshot::evaluated_at_or_completed`].
+    #[serde(default)]
+    pub evaluated_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub market_count: usize,
     pub quote_count: usize,
     pub opportunities: Vec<Opportunity>,
     pub source_health: Vec<SourceHealth>,
+}
+
+/// Everything a scan observed and decided: the inputs (markets, books,
+/// quotes, the paper portfolio whose exposure shaped sizing) alongside the
+/// snapshot, so the decision can be reproduced later with the same or
+/// different gates. Books exist only for markets that had a consensus; the
+/// rest were never fetched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanCapture {
+    pub snapshot: ScanSnapshot,
+    pub markets: Vec<UsMoneylineMarket>,
+    pub books: Vec<MarketBook>,
+    pub quotes: Vec<SourceQuote>,
+    pub portfolio: PaperPortfolio,
 }
 
 /// Everything about a scan except its opportunity rows; small enough for a
@@ -468,5 +586,18 @@ impl ScanSnapshot {
                 .count(),
             source_health: self.source_health.clone(),
         }
+    }
+
+    /// `evaluated_at`, or the best proxy an older snapshot offers: the first
+    /// opportunity's `generated_at` (the engine's clock at the time), else
+    /// `completed_at`.
+    pub fn evaluated_at_or_completed(&self) -> DateTime<Utc> {
+        if self.evaluated_at != DateTime::<Utc>::default() {
+            return self.evaluated_at;
+        }
+        self.opportunities
+            .first()
+            .map(|item| item.generated_at)
+            .unwrap_or(self.completed_at)
     }
 }

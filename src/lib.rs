@@ -2,11 +2,16 @@ pub mod config;
 pub mod consensus;
 pub mod domain;
 pub mod error;
+pub mod health;
+#[cfg(feature = "postgres")]
+pub mod history;
 pub mod matching;
+pub mod metrics;
 pub mod news;
 pub mod opportunity;
 pub mod paper;
 pub mod polymarket;
+pub mod replay;
 pub mod risk;
 pub mod scanner;
 pub mod sources;

@@ -2,13 +2,13 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -16,8 +16,8 @@ use crate::{
     config::Settings,
     consensus::build_consensus,
     domain::{
-        Opportunity, PaperPortfolio, RecommendationClass, ScanSnapshot, SourceHealth, SourceQuote,
-        Sport, UsMoneylineMarket,
+        ConsensusPrice, MarketBook, Opportunity, PaperPortfolio, RecommendationClass, ScanCapture,
+        ScanSnapshot, SourceFamily, SourceHealth, SourceQuote, Sport, UsMoneylineMarket,
     },
     matching::{match_quote, orient_quote},
     opportunity::OpportunityEngine,
@@ -86,12 +86,17 @@ impl Scanner {
             settings.polymarket_base_url.clone(),
             settings.request_timeout,
             settings.book_concurrency,
-        )?;
+        )?
+        .with_rate_limit(settings.polymarket_requests_per_second);
         Ok(Self::new(settings, polymarket, sources, store))
     }
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    pub fn polymarket(&self) -> &PolymarketUsClient {
+        &self.polymarket
     }
 
     pub fn source_ids(&self) -> Vec<String> {
@@ -134,43 +139,64 @@ impl Scanner {
         let (quotes, source_health) = self.collect_sources(&continuous, &Sport::ALL).await;
         let portfolio = self.store.load_portfolio(self.settings.bankroll).await?;
         let preliminary = self
-            .evaluate_markets(&markets, &quotes, &portfolio, false)
+            .evaluate_markets(&markets, &quotes, &portfolio, None, Utc::now())
             .await;
         let candidate_sports = preliminary
+            .opportunities
             .iter()
             .filter(|item| item.class != RecommendationClass::Rejected)
             .map(|item| item.sport)
             .collect::<HashSet<_>>();
 
-        let (final_quotes, mut opportunities, mut all_health) = if candidate_sports.is_empty() {
+        let (final_quotes, evaluation, mut all_health) = if candidate_sports.is_empty() {
             (quotes, preliminary, source_health)
         } else {
             let sports = candidate_sports.into_iter().collect::<Vec<_>>();
-            let confirmation_sources = self.confirmation_sources(&preliminary);
+            let confirmation_sources = self.confirmation_sources(&preliminary.opportunities);
             let (confirmation_quotes, confirmation_health) =
                 self.collect_sources(&confirmation_sources, &sports).await;
             let merged_quotes =
                 merge_confirmation(quotes, confirmation_quotes, &confirmation_sources, &sports);
             let confirmed = self
-                .evaluate_markets(&markets, &merged_quotes, &portfolio, true)
+                .evaluate_markets(
+                    &markets,
+                    &merged_quotes,
+                    &portfolio,
+                    Some(confirmation_sources.as_slice()),
+                    Utc::now(),
+                )
                 .await;
             let mut health = source_health;
             health.extend(confirmation_health);
             (merged_quotes, confirmed, health)
         };
+        let Evaluation {
+            evaluated_at,
+            mut opportunities,
+            books,
+        } = evaluation;
         opportunities.sort_by_key(|opportunity| Reverse(opportunity.net_edge));
         deduplicate_health(&mut all_health);
 
         let snapshot = ScanSnapshot {
             scan_id,
             started_at,
+            evaluated_at,
             completed_at: Utc::now(),
             market_count: markets.len(),
             quote_count: final_quotes.len(),
             opportunities,
             source_health: all_health,
         };
-        self.store.save_scan(&snapshot, &final_quotes).await?;
+        let capture = ScanCapture {
+            snapshot,
+            markets: Arc::unwrap_or_clone(markets),
+            books,
+            quotes: final_quotes,
+            portfolio,
+        };
+        self.store.save_scan(&capture).await?;
+        let snapshot = capture.snapshot;
         let news_candidates = snapshot
             .opportunities
             .iter()
@@ -304,53 +330,153 @@ impl Scanner {
         Ok(markets)
     }
 
+    /// `refetched` is `Some` on the confirmation pass: quotes from those
+    /// sources were just collected again and must be within
+    /// `confirmation_max_age`. Every other family keeps its preliminary
+    /// `fetched_at` and is judged against the preliminary window; applying the
+    /// tight window to them dropped whole families whenever the first pass
+    /// took longer than the window.
     async fn evaluate_markets(
         &self,
         markets: &[UsMoneylineMarket],
         quotes: &[SourceQuote],
         portfolio: &PaperPortfolio,
-        confirmation: bool,
-    ) -> Vec<Opportunity> {
-        let engine = OpportunityEngine::new(self.settings.clone());
-        let max_age = if confirmation {
-            self.settings.confirmation_max_age
-        } else {
-            self.settings.max_quote_age
+        refetched: Option<&[SharedSource]>,
+        now: DateTime<Utc>,
+    ) -> Evaluation {
+        let quotes = match refetched {
+            Some(refetched) => apply_confirmation_window(
+                quotes,
+                refetched,
+                self.settings.confirmation_max_age,
+                now,
+            ),
+            None => quotes.iter().collect(),
         };
-        let now = Utc::now();
-        let evaluable = markets
-            .iter()
-            .filter(|market| market.start_time > now)
-            .filter_map(|market| {
-                let matching = quotes
-                    .iter()
-                    .filter_map(|quote| {
-                        match_quote(market, quote)
-                            .map(|orientation| orient_quote(quote, orientation))
-                    })
-                    .collect::<Vec<_>>();
-                build_consensus(&matching, max_age.as_secs() as i64)
-                    .ok()
-                    .map(|consensus| (market, consensus))
-            })
-            .collect::<Vec<_>>();
+        let evaluable = consensus_markets(markets, &quotes, &self.settings, now);
         let slugs = evaluable
             .iter()
             .map(|(market, _)| market.market_slug.as_str())
             .collect::<Vec<_>>();
-        let books = self.polymarket.fetch_books(&slugs).await;
+        let fetched = self.polymarket.fetch_books(&slugs).await;
 
-        let mut opportunities = Vec::new();
-        for ((market, consensus), book) in evaluable.iter().zip(books) {
+        let mut books = Vec::with_capacity(fetched.len());
+        for ((market, _), book) in evaluable.iter().zip(fetched) {
             match book {
-                Ok(book) => {
-                    opportunities.extend(engine.evaluate(market, &book, consensus, portfolio))
-                }
+                Ok(book) => books.push(book),
                 Err(error) => warn!(market = market.market_slug, %error, "book fetch failed"),
             }
         }
-        opportunities
+        let opportunities = evaluate_books(&self.settings, &evaluable, &books, portfolio, now);
+        Evaluation {
+            evaluated_at: now,
+            opportunities,
+            books,
+        }
     }
+}
+
+/// One evaluation pass: the clock it used, its rows, and the books it
+/// fetched (only for markets that had a consensus).
+struct Evaluation {
+    evaluated_at: DateTime<Utc>,
+    opportunities: Vec<Opportunity>,
+    books: Vec<MarketBook>,
+}
+
+/// Every market not yet started that has a consensus from `quotes` as of
+/// `now`. Shared by the live scan and the replay so both match, orient, and
+/// filter quotes identically.
+pub fn consensus_markets<'a>(
+    markets: &'a [UsMoneylineMarket],
+    quotes: &[&SourceQuote],
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> Vec<(&'a UsMoneylineMarket, ConsensusPrice)> {
+    let max_age_seconds = settings.max_quote_age.as_secs() as i64;
+    let exchange_max_lead =
+        chrono::Duration::from_std(settings.exchange_max_lead).unwrap_or_default();
+    markets
+        .iter()
+        .filter(|market| market.start_time > now)
+        .filter_map(|market| {
+            let exclude_exchanges = market.start_time - now > exchange_max_lead;
+            let matching = quotes
+                .iter()
+                .filter(|quote| !(exclude_exchanges && is_exchange_family(&quote.family)))
+                .filter_map(|quote| {
+                    match_quote(market, quote).map(|orientation| orient_quote(quote, orientation))
+                })
+                .collect::<Vec<_>>();
+            match build_consensus(&matching, max_age_seconds, now) {
+                Ok(consensus) => Some((market, consensus)),
+                Err(error) if matching.is_empty() => {
+                    debug!(market = %market.market_slug, %error, "consensus unavailable");
+                    None
+                }
+                Err(error) => {
+                    warn!(market = %market.market_slug, %error, "consensus unavailable");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Classify every market in `evaluable` whose book is present in `books`
+/// (matched by slug). Markets without a book are skipped: the live scan
+/// failed to fetch it, or the replay never stored one.
+pub fn evaluate_books(
+    settings: &Settings,
+    evaluable: &[(&UsMoneylineMarket, ConsensusPrice)],
+    books: &[MarketBook],
+    portfolio: &PaperPortfolio,
+    now: DateTime<Utc>,
+) -> Vec<Opportunity> {
+    let engine = OpportunityEngine::new(settings.clone());
+    let by_slug = books
+        .iter()
+        .map(|book| (book.market_slug.as_str(), book))
+        .collect::<HashMap<_, _>>();
+    evaluable
+        .iter()
+        .filter_map(|(market, consensus)| {
+            by_slug
+                .get(market.market_slug.as_str())
+                .map(|book| engine.evaluate(market, book, consensus, portfolio, now))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Exchange prices are calibrated close to the start; further out they are
+/// excluded from the consensus (`exchange_max_lead`). Sportsbooks are not.
+fn is_exchange_family(family: &SourceFamily) -> bool {
+    matches!(
+        family,
+        SourceFamily::Kalshi | SourceFamily::PolymarketGlobal
+    )
+}
+
+/// Keep every quote except those from a refetched source whose `fetched_at`
+/// is older than `max_age`: a refetch that failed or fell back to a stale
+/// cache must not confirm a candidate on the preliminary price.
+fn apply_confirmation_window<'a>(
+    quotes: &'a [SourceQuote],
+    refetched: &[SharedSource],
+    max_age: Duration,
+    now: DateTime<Utc>,
+) -> Vec<&'a SourceQuote> {
+    let cutoff = now - chrono::Duration::from_std(max_age).unwrap_or_default();
+    quotes
+        .iter()
+        .filter(|quote| {
+            quote.fetched_at >= cutoff
+                || !refetched
+                    .iter()
+                    .any(|source| quote_belongs_to(quote, source.as_ref()))
+        })
+        .collect()
 }
 
 /// Adapters that fan one collector out into several books emit quote ids of
@@ -456,12 +582,12 @@ mod tests {
             conservative_probability: Decimal::ZERO,
             executable_price: Decimal::ZERO,
             maker_price: None,
+            maker_net_edge: None,
             raw_edge: Decimal::ZERO,
             net_edge: Decimal::ZERO,
             quantity: Decimal::ZERO,
             maximum_loss: Decimal::ZERO,
             estimated_fee: Decimal::ZERO,
-            source_count: source_ids.len(),
             family_count: source_ids.len(),
             source_ids: source_ids.iter().map(|id| id.to_string()).collect(),
             start_time: Utc::now() + chrono::Duration::hours(2),
@@ -514,6 +640,31 @@ mod tests {
                 ("kalshi", Sport::Mlb, Decimal::new(190, 2)),
                 ("kalshi", Sport::Nfl, Decimal::new(180, 2)),
             ]
+        );
+    }
+
+    #[test]
+    fn confirmation_window_only_binds_refetched_sources() {
+        let now = Utc::now();
+        let stale = now - chrono::Duration::seconds(120);
+        let kalshi = source("kalshi", SourceFamily::Kalshi, false);
+        let mut refetched_stale = quote("kalshi", Sport::Mlb, 180);
+        refetched_stale.fetched_at = stale;
+        let mut refetched_fresh = quote("kalshi", Sport::Nfl, 180);
+        refetched_fresh.fetched_at = now - chrono::Duration::seconds(30);
+        let mut untouched_stale = quote("espn:draftkings", Sport::Mlb, 180);
+        untouched_stale.fetched_at = stale;
+        let quotes = vec![refetched_stale, refetched_fresh, untouched_stale];
+
+        let kept = apply_confirmation_window(&quotes, &[kalshi], Duration::from_secs(90), now);
+        let mut seen = kept
+            .iter()
+            .map(|q| (q.source_id.as_str(), q.sport))
+            .collect::<Vec<_>>();
+        seen.sort_by_key(|(id, sport)| (id.to_string(), format!("{sport:?}")));
+        assert_eq!(
+            seen,
+            vec![("espn:draftkings", Sport::Mlb), ("kalshi", Sport::Nfl)]
         );
     }
 

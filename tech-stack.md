@@ -12,7 +12,8 @@
 | Numeric model | rust_decimal | Odds, probabilities, fees, VWAP, and risk without floats |
 | Time and IDs | Chrono and UUID | UTC freshness checks and stable market-side IDs |
 | Observability | tracing | Structured scanner and Lambda logs |
-| CLI | Clap | Scanner, source probe, terminal UI, and paper position commands |
+| CLI | Clap | Scanner, source probe, terminal UI, paper position, history and backtest commands |
+| History archive (optional) | Postgres via sqlx | Durable scan inputs, outcome grading for every market seen, replayable backtests |
 
 AWS SDK crates are feature-gated behind the `aws` Cargo feature. Browser
 collection support is feature-gated behind `browser`; it is not enabled for
@@ -38,17 +39,73 @@ Markets and `c` on Portfolio reuse the `paper open`/`close` rules.
 
 | Binary | local | cloud |
 | --- | --- | --- |
-| `local` | scan loop + news loop + retention in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` for systemd | n/a |
+| `local` | scan loop + news loop + settlement loop + retention in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` for systemd | n/a |
 | `scanner` | one-shot or `--continuous` against the file store | one-shot ECS task against S3/DynamoDB/SQS |
 | `tui` | attach-only viewer over `data/` | attach-only viewer over DynamoDB/S3 with the operator's AWS credentials |
-| `news-worker` | n/a (the `local` news loop drains `news-queue.ndjson`) | SQS-triggered Lambda |
-| `paper`, `source-probe` | file store | AWS store |
+| `paper`, `source-probe` | file store | AWS store (`paper settle` is how cloud-mode positions get closing lines and settlement; the ECS task does not run the settlement loop) |
 
 `news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Exa +
 deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
 `DisabledReviewer`. `Store::take_news_queue` and `Store::prune` are the two
 local-only operations; the AWS store's defaults are no-ops because SQS and S3
 lifecycle rules own those concerns.
+
+### Daemon liveness
+
+`health::HealthSnapshot` is built from the TUI's `EngineStatus` channel and
+written to `<data-dir>/health.json` by a publisher task in `local` on every
+status change (`storage::write_json_atomic`, shared with `latest-*.json`).
+`health::systemd` wraps `sd-notify` (Linux only; no-op elsewhere or without
+`NOTIFY_SOCKET`): `READY=1` after the loops spawn, `WATCHDOG=1` at the end of
+every scan attempt in `run_scan`, `STATUS=` with the health line, `STOPPING=1`
+on shutdown. `deploy/polybot-local.service` is `Type=notify`,
+`WatchdogSec=900` (three scan intervals), `Restart=always`, and runs the
+immutable `target/deploy/current/local` produced by `make deploy`. `local`
+handles SIGTERM like Ctrl-C so systemd stops drain the current step.
+`build.rs` embeds the short git commit as `POLYBOT_GIT_COMMIT` for the health
+file.
+
+### History archive (`postgres` feature)
+
+`storage::store_for(settings, data_dir, Archive)` wraps the mode store in
+`ArchivingStore` when `DATABASE_URL` is set and the binary writes scans
+(`local`, `scanner`; viewers pass `Archive::Disabled`). The wrapper forwards
+every `Store` call and additionally records `save_scan` and `save_news` into
+Postgres through `history::History`. An archive failure fails the scan: the
+operator asked for the archive, and a silent gap would corrupt every backtest
+over the window. Without `DATABASE_URL` nothing is opened; with it and no
+`postgres` feature, startup fails with a clear config error.
+
+Stack: `sqlx 0.8` (postgres, rustls, `rust_decimal` → `NUMERIC`, `uuid`,
+`chrono`, `json`), one `PgPool` of four connections, migrations as plain SQL
+in `migrations/` embedded with `sqlx::migrate!` and applied on connect. Tables
+(`migrations/202609130001_history.sql`): `scans` (clock, gates, portfolio,
+source health, origin `live|import`), `markets` (slowly changing, latest
+definition as JSONB), `scan_books` (bids/offers per scan and market, with the
+market fields that vary between scans), `scan_quotes` (raw quote JSONB plus
+filter columns), `opportunities` (every side, flattened), `news_evidence`,
+`market_outcomes` (closing line, settlement, attempts, backoff), and
+`backtest_runs`. Every row keeps observation time (`fetched_at`,
+`evaluated_at`) apart from event time (`start_time`, `source_timestamp`).
+
+Determinism is what makes the archive replayable: `consensus::build_consensus`,
+`OpportunityEngine::evaluate`, and `ResearchOpportunity::at` take `now`
+explicitly, the scanner evaluates a whole pass at one instant recorded as
+`ScanSnapshot::evaluated_at`, and `scanner::consensus_markets` /
+`scanner::evaluate_books` are the shared pure functions both the live pass and
+`replay::Replay` call. `backtest --audit` recomputes every live frame under
+its archived gates and portfolio and diffs it against the stored rows; the
+mismatch count is the regression guard for that seam.
+
+`History::grade_outcomes` (engine settlement tick and `history grade`) walks
+markets past start without a settlement, inside a 14-day window, in batches
+of `GRADING_BATCH` with a 10 min → 1 h → 6 h backoff per market, fetching the
+closing line once and the settlement until published. `History::reader()`
+opens a `REPEATABLE READ READ ONLY` transaction so a replay sees one snapshot
+of frames and outcomes. `replay::Replay` steps frames in order, settles
+positions `settlement_lag_hours` after start when an outcome exists, and never
+fills an order against the book it was decided on under `FillModel::NextBook`.
+`metrics` holds the pure Brier / reliability / summary / drawdown arithmetic.
 
 Local performance choices, all measured against live endpoints: Polymarket
 discovery runs the five sports concurrently with gzip and is cached for
@@ -147,15 +204,34 @@ Base URL:
 https://gateway.polymarket.us
 ```
 
-The client uses structured league/sport discovery endpoints and the US market
-book endpoint. No wallet, CLOB signing, Polygon, or non-US order code is
-included.
+`polymarket::PolymarketUsClient` uses the structured league/sport discovery
+endpoints, `GET /v1/markets/{slug}/book` for depth, and two public endpoints
+that grade paper positions after the fact: `GET /v1/markets/{slug}/settlement`
+(404 until the market resolves) and `GET /v1/price-history?symbol={slug}&
+fixedInterval=INTERVAL_LIVE&fidelity=1`, whose series starts 15 minutes before
+the event; the last point at or before scheduled start is the closing line.
+Every request takes a concurrency permit (`POLYMARKET_CONCURRENCY`) and then a
+slot from a shared pacer (`POLYMARKET_REQUESTS_PER_SECOND`, default 18 against
+the documented 20 req/s/IP public limit); a 429 pushes the pacer out one
+second and retries once. No wallet, CLOB signing, Polygon, or non-US order code
+is included.
+
+Fee schedule (effective 2026-07-01): taker `0.06 * C * p * (1 - p)` per fill,
+banker's-rounded to cents, order total capped at the rounding of the cumulative
+exact fee; makers pay nothing and receive `0.0125 * C * p * (1 - p)`. The
+market's `feeCoefficient` is read per market; the maker rebate coefficient is
+`MAKER_REBATE_COEFFICIENT`.
 
 The US book has one YES instrument:
 
 - Long execution consumes YES offers.
 - Opposing-outcome execution consumes YES bids at a side cost of
   `1 - YES bid`.
+
+Settlement rules that matter for a moneyline bot: NFL ties pay $0.50;
+pre-start withdrawal, postponement past expiry, cancellation and no-contest
+settle at *last fair market price* (ITF tennis at $0.50), where sportsbooks
+void. Those phrases are hard `review` terms for the keyword reviewer.
 
 ### Odds Adapters
 
@@ -249,20 +325,43 @@ two hours cannot preserve an actionable classification.
 ### Consensus
 
 - Reject quotes not observed within the freshness window (`fetched_at`),
-  future-dated quotes, and validation-only quotes.
+  future-dated quotes, and validation-only quotes. On the confirmation pass
+  only refetched sources are held to `CONFIRMATION_MAX_AGE_SECONDS`; the rest
+  keep the preliminary `MAX_QUOTE_AGE_SECONDS`.
+- Kalshi and Polymarket global quotes are excluded for games starting more
+  than `EXCHANGE_MAX_LEAD_HOURS` out.
 - Keep the most recently observed quote per source family.
 - Remove vig proportionally, including neutral settlement outcomes.
 - Use median fair probability and median absolute deviation.
 - Remove outliers beyond the configured robust limit.
+- A market with matched quotes but no consensus (invalid odds, all outliers)
+  is logged at `warn`; unmatched markets at `debug`.
 
 ### Risk and Execution
 
 - Use Decimal for every monetary and probability calculation.
+- `conservative = fair - MAD - CONSENSUS_BIAS`; raw edge uses `fair`, net edge
+  and sizing use `conservative`.
+- Reject rows inside `MINIMUM_LEAD_MINUTES` of start.
 - Walk multiple order-book levels to a maximum side price.
-- Apply fee coefficients and banker's rounding.
-- Recompute edge from execution VWAP.
-- Size with quarter Kelly.
-- Enforce minimum quantity, 1-5% position risk, and $5 total exposure.
+- Apply the venue's fee arithmetic per fill and cap the order total.
+- Recompute edge from execution VWAP; size with `KELLY_FRACTION` Kelly at top
+  of book, then once more at the VWAP cost and keep the smaller.
+- Report `maker_net_edge` (rebate instead of fee, one tick inside the spread)
+  without letting it classify.
+- Enforce minimum quantity, 1-5% position risk, `MAXIMUM_EVENT_EXPOSURE` per
+  event, and $5 total exposure.
+
+### Paper Ledger
+
+`paper::settle_positions` runs from the `local` engine loop every
+`SETTLEMENT_POLL_SECONDS` and from `paper settle`. For each open position past
+its start time it records the closing side price once, then, when the venue
+publishes a settlement, books `quantity * (payout - entry) - fee`, archives the
+position under `closed_positions`, and sets `bankroll = PAPER_BANKROLL +
+realized`. `Store::load_portfolio` recomputes realized P&L and bankroll from
+the closed positions on every load, so the JSON file (or DynamoDB item) is
+never the source of truth for derived totals.
 
 ## Infrastructure as Code
 

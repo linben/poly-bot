@@ -9,7 +9,7 @@ use clap::Parser;
 use polybot::{
     Result,
     config::Settings,
-    storage::store_for,
+    storage::{Archive, store_for},
     tui::{self, TuiOptions},
 };
 
@@ -23,7 +23,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let settings = Settings::from_env()?;
-    let store = store_for(settings.run_mode, &args.data_dir).await?;
+    let store = store_for(&settings, &args.data_dir, Archive::Disabled).await?;
     // Logs would corrupt the screen; the attached viewer has nothing to log.
     let logs = tui::log::LogBuffer::install(tracing_subscriber::EnvFilter::new("warn"), 200);
     tui::run(TuiOptions {

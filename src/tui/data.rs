@@ -179,11 +179,7 @@ pub async fn load_store_view(store: &dyn Store, settings: &Settings) -> StoreVie
             loaded_at,
             scan: None,
             rows: Vec::new(),
-            portfolio: PaperPortfolio {
-                bankroll: settings.bankroll,
-                open_exposure: Decimal::ZERO,
-                open_positions: Vec::new(),
-            },
+            portfolio: PaperPortfolio::new(settings.bankroll),
             error: Some(error.to_string()),
             stats: EdgeStats::default(),
         },
@@ -205,11 +201,7 @@ pub fn spawn_store_poller(
         loaded_at: Utc::now(),
         scan: None,
         rows: Vec::new(),
-        portfolio: PaperPortfolio {
-            bankroll: settings.bankroll,
-            open_exposure: Decimal::ZERO,
-            open_positions: Vec::new(),
-        },
+        portfolio: PaperPortfolio::new(settings.bankroll),
         error: None,
         stats: EdgeStats::default(),
     }));

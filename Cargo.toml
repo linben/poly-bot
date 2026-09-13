@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
+build = "build.rs"
 
 [features]
 default = []
@@ -18,6 +19,10 @@ aws = [
     "dep:lambda_runtime",
 ]
 browser = ["dep:chromiumoxide"]
+# Postgres history archive: durable scan inputs, outcome grading for every
+# market seen, and the `backtest` binary. Optional so a laptop can run the
+# file store alone.
+postgres = ["dep:sqlx"]
 
 [dependencies]
 async-trait = "0.1"
@@ -46,6 +51,11 @@ aws-sdk-sqs = { version = "1", optional = true }
 aws_lambda_events = { version = "0.18", optional = true, default-features = false, features = ["sqs"] }
 lambda_runtime = { version = "0.14", optional = true }
 chromiumoxide = { version = "0.8", optional = true, features = ["tokio-runtime"] }
+sqlx = { version = "0.8", optional = true, default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "migrate", "chrono", "json", "rust_decimal", "uuid"] }
+
+# systemd readiness and watchdog notifications; a no-op without NOTIFY_SOCKET.
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.5"
 
 [dev-dependencies]
 httpmock = "0.8"
@@ -75,6 +85,16 @@ path = "src/bin/paper.rs"
 [[bin]]
 name = "local"
 path = "src/bin/local.rs"
+
+[[bin]]
+name = "backtest"
+path = "src/bin/backtest.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "history"
+path = "src/bin/history.rs"
+required-features = ["postgres"]
 
 [profile.release]
 lto = "thin"

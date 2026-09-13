@@ -1,11 +1,13 @@
 use std::{env, str::FromStr, time::Duration};
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
 /// Where state lives and which event-driven services run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RunMode {
     /// Single host: file-backed store, in-process news loop and terminal UI.
     Local,
@@ -26,7 +28,10 @@ impl FromStr for RunMode {
     }
 }
 
-#[derive(Debug, Clone)]
+/// `Deserialize` reads the JSON a scan was archived with (`#[serde(default)]`
+/// fills fields added since), so a replay can audit under the same gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub run_mode: RunMode,
     pub polymarket_base_url: String,
@@ -59,12 +64,41 @@ pub struct Settings {
     pub minimum_position_fraction: Decimal,
     pub maximum_position_fraction: Decimal,
     pub maximum_total_exposure: Decimal,
+    /// Cap on paper exposure across every market of one event, so both sides
+    /// or several markets of the same game cannot absorb the whole budget.
+    pub maximum_event_exposure: Decimal,
     /// Actionable requires a reference sportsbook (Pinnacle-class) in the
     /// consensus. Only the confirmation tier supplies one; switching this off
     /// lets a full free-source quorum reach actionable.
     pub require_reference_book: bool,
     pub kelly_fraction: Decimal,
+    /// Subtracted from the backed side's fair probability before net edge and
+    /// Kelly. Bookmaker consensus over-states the probability of the outcome
+    /// you back by a roughly constant intercept (Kaunitz et al. 2017 measured
+    /// 0.034-0.037 on football closing odds); this is the prior until paper
+    /// settlement history can fit it.
+    pub consensus_bias: Decimal,
+    /// A market starting sooner than this is not actionable: prices near start
+    /// move on lineups faster than a five-minute scan follows.
+    pub minimum_lead: Duration,
+    /// Exchange families (Kalshi, Polymarket global) are excluded from the
+    /// consensus for games starting further out than this; exchange prices
+    /// are calibrated 30-240 min before close and drift beyond that.
+    pub exchange_max_lead: Duration,
+    /// Maker rebate coefficient from the venue fee schedule (Theta =
+    /// -0.0125). Used only to report `maker_net_edge`.
+    pub maker_rebate_coefficient: Decimal,
+    /// Public gateway limit is 20 requests/second/IP; stay under it.
+    pub polymarket_requests_per_second: u32,
+    /// How often open paper positions are checked for a closing line and a
+    /// settlement price.
+    pub settlement_poll: Duration,
     pub source_config_path: String,
+    /// Postgres history archive (`DATABASE_URL`). Optional: unset means the
+    /// file or AWS store alone; set (with the `postgres` feature) records
+    /// every scan's inputs, grades every market seen, and enables `backtest`.
+    #[serde(skip)]
+    pub database_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -94,8 +128,16 @@ impl Default for Settings {
             maximum_position_fraction: Decimal::new(5, 2),
             require_reference_book: true,
             maximum_total_exposure: Decimal::new(5, 0),
+            maximum_event_exposure: Decimal::new(25, 1),
             kelly_fraction: Decimal::new(25, 2),
+            consensus_bias: Decimal::new(2, 2),
+            minimum_lead: Duration::from_secs(15 * 60),
+            exchange_max_lead: Duration::from_secs(4 * 3600),
+            maker_rebate_coefficient: Decimal::new(125, 4),
+            polymarket_requests_per_second: 18,
+            settlement_poll: Duration::from_secs(600),
             source_config_path: "config/sources.json".into(),
+            database_url: None,
         }
     }
 }
@@ -105,6 +147,10 @@ impl Settings {
         let mut settings = Self::default();
         set_string("POLYMARKET_BASE_URL", &mut settings.polymarket_base_url);
         set_string("SOURCE_CONFIG_PATH", &mut settings.source_config_path);
+        settings.database_url = env::var("DATABASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         settings.run_mode = parse_env("RUN_MODE", settings.run_mode)?;
         settings.source_concurrency = parse_env("SOURCE_CONCURRENCY", settings.source_concurrency)?;
         settings.book_concurrency = parse_env("POLYMARKET_CONCURRENCY", settings.book_concurrency)?;
@@ -148,6 +194,43 @@ impl Settings {
         )?;
         settings.maximum_total_exposure =
             parse_env("MAXIMUM_TOTAL_EXPOSURE", settings.maximum_total_exposure)?;
+        settings.maximum_event_exposure =
+            parse_env("MAXIMUM_EVENT_EXPOSURE", settings.maximum_event_exposure)?;
+        settings.kelly_fraction = parse_env("KELLY_FRACTION", settings.kelly_fraction)?;
+        settings.consensus_bias = parse_env("CONSENSUS_BIAS", settings.consensus_bias)?;
+        settings.max_quote_age = Duration::from_secs(parse_env(
+            "MAX_QUOTE_AGE_SECONDS",
+            settings.max_quote_age.as_secs(),
+        )?);
+        settings.confirmation_max_age = Duration::from_secs(parse_env(
+            "CONFIRMATION_MAX_AGE_SECONDS",
+            settings.confirmation_max_age.as_secs(),
+        )?);
+        settings.book_max_age = Duration::from_secs(parse_env(
+            "BOOK_MAX_AGE_SECONDS",
+            settings.book_max_age.as_secs(),
+        )?);
+        settings.minimum_lead = Duration::from_secs(
+            parse_env("MINIMUM_LEAD_MINUTES", settings.minimum_lead.as_secs() / 60)? * 60,
+        );
+        settings.exchange_max_lead = Duration::from_secs(
+            parse_env(
+                "EXCHANGE_MAX_LEAD_HOURS",
+                settings.exchange_max_lead.as_secs() / 3600,
+            )? * 3600,
+        );
+        settings.maker_rebate_coefficient = parse_env(
+            "MAKER_REBATE_COEFFICIENT",
+            settings.maker_rebate_coefficient,
+        )?;
+        settings.polymarket_requests_per_second = parse_env(
+            "POLYMARKET_REQUESTS_PER_SECOND",
+            settings.polymarket_requests_per_second,
+        )?;
+        settings.settlement_poll = Duration::from_secs(parse_env(
+            "SETTLEMENT_POLL_SECONDS",
+            settings.settlement_poll.as_secs(),
+        )?);
         settings.validate()?;
         Ok(settings)
     }
@@ -187,6 +270,39 @@ impl Settings {
             || self.maximum_total_exposure > self.bankroll
         {
             return Err(Error::Config("paper risk limits are invalid".into()));
+        }
+        if self.maximum_event_exposure <= Decimal::ZERO
+            || self.maximum_event_exposure > self.maximum_total_exposure
+        {
+            return Err(Error::Config(
+                "MAXIMUM_EVENT_EXPOSURE must be positive and at most MAXIMUM_TOTAL_EXPOSURE".into(),
+            ));
+        }
+        if self.kelly_fraction <= Decimal::ZERO || self.kelly_fraction > Decimal::ONE {
+            return Err(Error::Config("KELLY_FRACTION must be in (0, 1]".into()));
+        }
+        if self.consensus_bias < Decimal::ZERO || self.consensus_bias >= Decimal::new(5, 1) {
+            return Err(Error::Config("CONSENSUS_BIAS must be in [0, 0.5)".into()));
+        }
+        if self.maker_rebate_coefficient < Decimal::ZERO {
+            return Err(Error::Config(
+                "MAKER_REBATE_COEFFICIENT must be non-negative".into(),
+            ));
+        }
+        if self.max_quote_age.is_zero()
+            || self.confirmation_max_age.is_zero()
+            || self.confirmation_max_age > self.max_quote_age
+            || self.book_max_age.is_zero()
+        {
+            return Err(Error::Config(
+                "quote and book age windows must be positive, confirmation at most the preliminary window".into(),
+            ));
+        }
+        if self.polymarket_requests_per_second == 0 || self.settlement_poll.is_zero() {
+            return Err(Error::Config(
+                "POLYMARKET_REQUESTS_PER_SECOND and SETTLEMENT_POLL_SECONDS must be positive"
+                    .into(),
+            ));
         }
         Ok(())
     }
