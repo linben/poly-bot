@@ -34,7 +34,10 @@ For each supported pregame moneyline, Polybot should answer:
 
 The output is an operational terminal dashboard with actionable, watchlist, and
 rejected candidates. Every classification includes enough source, price,
-timing, and news context to audit the decision.
+timing, and news context to audit the decision. Over time the system should
+also answer, from its own history rather than from claims: how well the
+sportsbook consensus and the Polymarket US price each predicted settled
+outcomes, and whether the edges it flagged were real.
 
 ## Principles
 
@@ -71,8 +74,12 @@ of maximum loss.
 
 ### Reproducible Research
 
-Raw scans, source timestamps, parser versions, normalized quotes, decisions,
-and news citations are retained so a recommendation can be reconstructed.
+Raw scans, source timestamps, parser versions, normalized quotes, order books,
+decisions with their reasons, and news citations are retained so a
+recommendation can be reconstructed. Every retained record carries the time it
+was observed separately from the time of the event it describes, and the
+classifier is a pure function of its inputs and a supplied clock, so a replay
+over the archive reproduces the live decision rather than approximating it.
 
 ## Initial Scope
 
@@ -89,6 +96,11 @@ and news citations are retained so a recommendation can be reconstructed.
 - Exa search and Bedrock news review
 - Explicit paper position open and close workflow
 - Terminal UI over the local or cloud store
+- Optional Postgres history archive: every scan's markets, books, quotes and
+  rows; closing line and settlement for every market seen; replayable
+  backtests with calibration, closing-line value and paper P&L reporting
+- Unattended operation: a systemd service with a health file and watchdog
+  locally, a scheduled ECS task with alarms in the cloud
 
 ## Non-Goals
 
@@ -124,34 +136,61 @@ rejected candidate.
 
 The first production phase is successful when:
 
-- Scheduled scans complete reliably every five minutes
+- Scheduled scans complete reliably every five minutes, unattended
 - Every configured source adapter is monitored for freshness and failures
 - No actionable result violates matching, quorum, price, or exposure rules
 - Every actionable result has current news evidence and traceable citations
 - Paper positions and maximum loss remain internally consistent
-- Scanner overlap, Lambda failures, and news DLQ messages are alarmed
-- Historical paper results can be evaluated without look-ahead data
+- The running system is supervised from outside the process: locally by a
+  health file and a systemd watchdog that restarts a hung scan loop; in the
+  cloud by alarms on scanner overlap, Lambda failures, and the news DLQ
+- Every market the scanner evaluated is graded against the venue's closing
+  line and settlement, not only the markets a paper position was opened on
+- Historical decisions can be replayed without look-ahead data, and the
+  replay reproduces the live classification exactly
 
 Profit is not an initial acceptance criterion. A statistically meaningful
 paper history, calibration, drawdown, and execution-slippage review must come
 before any proposal for authenticated live trading.
 
+## Deployment Model
+
+Local mode is the primary deployment: one `local` process on a single host
+runs the scan, news, settlement, and grading loops, opens the terminal UI when
+run interactively, and runs as a systemd service otherwise. Everything it
+needs is a Rust toolchain and outbound HTTPS.
+
+Two layers are optional and independent:
+
+- **History archive (Postgres).** Adds durable point-in-time inputs, outcome
+  grading for every market seen, and the `backtest` replay. Without it the
+  file store keeps a rolling window and the paper ledger alone is graded.
+- **Cloud mode (AWS).** The same scanner as a scheduled one-shot ECS task
+  with S3, DynamoDB, SQS and a news Lambda, for operators who would rather
+  not keep a host running. It shares every decision path with local mode and
+  is kept working, but it is not where the research history accumulates
+  unless its `DATABASE_URL` points at a reachable Postgres.
+
+Adding a layer never changes a classification; it changes only what is
+retained and who restarts the process.
+
 ## Future Direction
 
-Settlement ingestion, paper P&L, and closing-line value are recorded per
-position. With the optional Postgres archive, every scan's inputs are kept
-and every market seen is graded, so the same questions can be asked of the
-whole evaluated universe rather than a handful of paper positions, and
-`backtest` replays the classifier over that history using only point-in-time
-data. After sufficient history:
+The archive turns the open questions from "wait for paper positions to
+settle" into queries over every market the scanner has seen. After enough
+history has accumulated:
 
 1. Fit `CONSENSUS_BIAS` and the exchange lead window from realized
    calibration (the archive's reliability buckets) instead of literature
-   priors.
+   priors, and confirm the change with `backtest` before it goes live.
 2. Measure drawdown, source contribution, and maker-vs-taker fill assumptions
-   against the recorded closing lines.
-3. Tune sport-specific matching and settlement policies.
-4. Evaluate whether a separate, explicitly approved live-execution service is
+   against the recorded closing lines and next-book fills.
+3. Tune sport-specific matching and settlement policies from graded
+   outcomes, including the venue's last-fair-price settlements.
+4. Bring cloud mode to parity with local mode for research: grade outcomes
+   from the scheduled task and point its archive at a managed Postgres, so a
+   host is not required to accumulate history.
+5. Evaluate whether a separate, explicitly approved live-execution service is
    justified.
 
 Any live-execution phase must remain isolated from research, use separate

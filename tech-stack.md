@@ -4,7 +4,7 @@
 
 | Area | Technology | Purpose |
 | --- | --- | --- |
-| Language | Rust 2024 edition, Rust 1.90+ | Scanner, terminal UI, source adapters, news worker, paper CLI |
+| Language | Rust 2024 edition, Rust 1.90+ | Scanner, terminal UI, source adapters, news worker, paper/history/backtest CLIs |
 | Async runtime | Tokio | Concurrent HTTP collection and service execution |
 | HTTP client | Reqwest with rustls | Polymarket, source adapters, and Exa search |
 | Terminal UI | ratatui + crossterm | Operator views over the local or cloud store |
@@ -13,11 +13,16 @@
 | Time and IDs | Chrono and UUID | UTC freshness checks and stable market-side IDs |
 | Observability | tracing | Structured scanner and Lambda logs |
 | CLI | Clap | Scanner, source probe, terminal UI, paper position, history and backtest commands |
-| History archive (optional) | Postgres via sqlx | Durable scan inputs, outcome grading for every market seen, replayable backtests |
+| Process supervision | systemd `Type=notify` + `sd-notify`, `health.json` | Readiness, watchdog, status line, out-of-process liveness |
+| History archive (optional) | Postgres 18 via sqlx | Durable scan inputs, outcome grading for every market seen, replayable backtests |
+| Cloud mode (optional) | ECS Fargate, S3, DynamoDB, SQS, Lambda, Terraform | Scheduled scans and news review without a host |
 
-AWS SDK crates are feature-gated behind the `aws` Cargo feature. Browser
-collection support is feature-gated behind `browser`; it is not enabled for
-unapproved sportsbook automation.
+Three Cargo features gate optional layers, all off by default so a laptop
+build needs only a Rust toolchain: `postgres` (history archive, `history` and
+`backtest` binaries), `aws` (cloud store, Bedrock reviewer, `news-worker`
+Lambda), and `browser` (headless collection; not enabled for unapproved
+sportsbook automation). `sd-notify` is a Linux-only dependency and a no-op
+outside systemd.
 
 ### Terminal UI
 
@@ -35,14 +40,17 @@ Markets and `c` on Portfolio reuse the `paper open`/`close` rules.
 ## Run Modes
 
 `config::RunMode` (`RUN_MODE=local|cloud`) is read once and threaded through
-`storage::store_for`, so every binary opens the right store:
+`storage::store_for(settings, data_dir, Archive)`, so every binary opens the
+right store; `DATABASE_URL` optionally wraps it in the history archive (below)
+in either mode:
 
 | Binary | local | cloud |
 | --- | --- | --- |
-| `local` | scan loop + news loop + settlement loop + retention in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` for systemd | n/a |
+| `local` | scan loop + news loop + settlement/grading loop + retention + health file in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` under systemd | n/a |
 | `scanner` | one-shot or `--continuous` against the file store | one-shot ECS task against S3/DynamoDB/SQS |
 | `tui` | attach-only viewer over `data/` | attach-only viewer over DynamoDB/S3 with the operator's AWS credentials |
 | `paper`, `source-probe` | file store | AWS store (`paper settle` is how cloud-mode positions get closing lines and settlement; the ECS task does not run the settlement loop) |
+| `history`, `backtest` (`postgres` feature) | archive status, import, grading; replay and parity audit | same, against whichever Postgres `DATABASE_URL` names |
 
 `news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Exa +
 deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
@@ -107,14 +115,22 @@ positions `settlement_lag_hours` after start when an outcome exists, and never
 fills an order against the book it was decided on under `FillModel::NextBook`.
 `metrics` holds the pure Brier / reliability / summary / drawdown arithmetic.
 
-Local performance choices, all measured against live endpoints: Polymarket
-discovery runs the five sports concurrently with gzip and is cached for
-`DISCOVERY_REFRESH_SECONDS`; books are fetched through a semaphore
-(`POLYMARKET_CONCURRENCY`) instead of a serial throttle; each odds adapter
-collects its sports concurrently. Steady-state scans complete in roughly half
-a second.
+Local performance, measured against live endpoints on 2026-09-13 with six
+continuous sources: Polymarket discovery runs the five sports concurrently
+with gzip (~3 s) and is cached for `DISCOVERY_REFRESH_SECONDS`; books are
+fetched through a semaphore (`POLYMARKET_CONCURRENCY`) and paced to
+`POLYMARKET_REQUESTS_PER_SECOND` (~70 books ≈ 4 s); each odds adapter
+collects its sports concurrently, Smarkets being the slowest at ~4.6 s. A
+cold scan takes 11-13 s and a steady-state scan 9-10 s, well inside the
+five-minute cadence and the 15-minute watchdog.
 
-## AWS Architecture
+## AWS Architecture (cloud mode)
+
+Cloud mode is the same scanner, consensus, sizing and news code behind
+`RUN_MODE=cloud`, deployed as managed services for operators who do not want
+to keep a host running. It is kept working and shares every decision path
+with local mode; the research history (books, outcome grading, backtests)
+accumulates only where the archive is configured, which today is local mode.
 
 ### ECS Fargate
 
@@ -133,9 +149,14 @@ The task:
 5. When a candidate survives, refetches up to three contributing continuous
    sources plus every confirmation-tier source for the candidate sports.
 6. Fetches current Polymarket books and performs depth-aware sizing.
-7. Writes scans and recommendations.
+7. Writes the scan capture (snapshot, quotes, markets, books) to S3 and the
+   latest recommendations to DynamoDB; archives to Postgres as well when
+   `DATABASE_URL` is set and the image was built with `postgres`.
 8. Queues news candidates.
 9. Releases the lease and exits.
+
+The task does not settle paper positions or grade market outcomes; `paper
+settle` and `history grade` do that from an operator's machine.
 
 ### Lambda
 
@@ -156,15 +177,20 @@ data services below.
 
 ### Amazon S3
 
-S3 stores immutable scan and quote snapshots under date partitions:
+S3 stores immutable scan snapshots under date partitions, the same four files
+the local store writes:
 
 ```text
-scans/year=YYYY/month=MM/day=DD/<scan-id>.json
-scans/year=YYYY/month=MM/day=DD/<scan-id>-quotes.json
+scans/year=YYYY/month=MM/day=DD/<scan-id>.json           # ScanSnapshot
+scans/year=YYYY/month=MM/day=DD/<scan-id>-quotes.json    # SourceQuote[]
+scans/year=YYYY/month=MM/day=DD/<scan-id>-markets.json   # UsMoneylineMarket[]
+scans/year=YYYY/month=MM/day=DD/<scan-id>-books.json     # MarketBook[] (markets with a consensus)
 ```
 
 The bucket uses versioning, server-side encryption, blocked public access, and
-a lifecycle transition.
+a lifecycle transition. Nothing reads these back today; `history import` reads
+the local equivalents, so an S3 sync to a host is the path to backtesting a
+cloud deployment's history.
 
 ### Amazon DynamoDB
 
@@ -352,7 +378,7 @@ two hours cannot preserve an actionable classification.
 - Enforce minimum quantity, 1-5% position risk, `MAXIMUM_EVENT_EXPOSURE` per
   event, and $5 total exposure.
 
-### Paper Ledger
+### Paper Ledger and Outcomes
 
 `paper::settle_positions` runs from the `local` engine loop every
 `SETTLEMENT_POLL_SECONDS` and from `paper settle`. For each open position past
@@ -362,6 +388,11 @@ position under `closed_positions`, and sets `bankroll = PAPER_BANKROLL +
 realized`. `Store::load_portfolio` recomputes realized P&L and bankroll from
 the closed positions on every load, so the JSON file (or DynamoDB item) is
 never the source of truth for derived totals.
+
+The paper ledger grades only the handful of positions an operator opened.
+With the history archive, `History::grade_outcomes` applies the same two
+endpoints to every market the scanner evaluated, into `market_outcomes`; that
+table, not the ledger, is what calibration and closing-line analysis read.
 
 ## Infrastructure as Code
 
@@ -385,10 +416,17 @@ archives are built with `cargo-lambda` for `arm64`.
 Primary commands:
 
 ```bash
-make check
-make test
-make tui
-make probe
+make check              # fmt + clippy, all targets and features, warnings denied
+make test               # cargo test --all-features
+make local              # engine + terminal UI
+make local-headless     # engine only (what the systemd unit runs)
+make tui                # attach a viewer
+make probe              # source-probe --adapters-only
+make deploy             # immutable target/deploy/<sha>/ + current symlink
+make db-up              # compose Postgres for the history archive
+make history-import history-status history-grade
+make backtest ARGS="--from 2026-09-01 --open-class watchlist"
+make backtest-audit ARGS="--from 2026-09-01"
 make terraform-check
 make lambda
 ```
@@ -396,13 +434,19 @@ make lambda
 Quality gates include:
 
 - `cargo fmt --check`
-- Clippy across all targets and features with warnings denied
+- Clippy across all targets and features with warnings denied, and again
+  with default features so the laptop build (no Postgres, no AWS) stays clean
 - Unit and fixture tests across all features
 - Terraform formatting and validation
+- `backtest --audit` over recent live frames reports zero mismatches
 
 Fixtures cover Polymarket event and book payloads, canonical source quotes,
 YES/opposing-outcome conversion, fee rounding, multi-level sizing, matching,
-quorum filtering, stale data, news gating, leases, and portfolio invariants.
+quorum filtering, stale data, news gating, leases, portfolio invariants,
+replay fills and settlement, and the Brier/reliability/drawdown metrics. The
+Postgres layer has no automated integration test yet; it is verified by
+`history import` / `history grade` / `backtest --audit` against a live
+database.
 
 ## Deliberate Exclusions
 
