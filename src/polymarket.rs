@@ -2,10 +2,13 @@ use std::{cmp::Reverse, collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, future, stream};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
-use serde::Deserialize;
-use tokio::sync::Semaphore;
+use serde::{Deserialize, de::DeserializeOwned};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 
 use crate::{
     Error, Result,
@@ -13,18 +16,36 @@ use crate::{
 };
 
 /// Polymarket US public gateway. Measured 2026-09: book requests answer in
-/// ~20 ms and 32 concurrent requests were not throttled; an NFL events page
-/// is 42 MB uncompressed (1.4 MB gzip) and takes ~2 s server-side, so
-/// discovery runs all sports concurrently and callers cache the result.
+/// ~20 ms and 32 concurrent requests were not throttled, but the documented
+/// public limit is 20 requests/second/IP, so request starts are paced (18/s
+/// by default) and a 429 is retried once after backing off for a second. An
+/// NFL events page is 42 MB uncompressed (1.4 MB gzip) and takes ~2 s
+/// server-side, so discovery runs all sports concurrently and callers cache
+/// the result.
 #[derive(Clone)]
 pub struct PolymarketUsClient {
     base_url: String,
     client: Client,
     permits: Arc<Semaphore>,
     concurrency: usize,
+    /// Earliest instant the next request may start; shared by clones.
+    pacer: Arc<Mutex<Instant>>,
+    min_interval: Duration,
+}
+
+/// Pre-game closing line for a market: side prices at the last observation
+/// before the scheduled start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosingPrice {
+    pub long_price: Decimal,
+    pub short_price: Decimal,
+    pub observed_at: DateTime<Utc>,
 }
 
 impl PolymarketUsClient {
+    const DEFAULT_REQUESTS_PER_SECOND: u32 = 18;
+    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
+
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self> {
         Self::with_concurrency(base_url, timeout, 8)
     }
@@ -44,7 +65,20 @@ impl PolymarketUsClient {
             client,
             permits: Arc::new(Semaphore::new(concurrency.max(1))),
             concurrency: concurrency.max(1),
+            pacer: Arc::new(Mutex::new(Instant::now())),
+            min_interval: Self::interval_for(Self::DEFAULT_REQUESTS_PER_SECOND),
         })
+    }
+
+    /// Space request starts so no more than `requests_per_second` begin in
+    /// any one-second window.
+    pub fn with_rate_limit(mut self, requests_per_second: u32) -> Self {
+        self.min_interval = Self::interval_for(requests_per_second);
+        self
+    }
+
+    fn interval_for(requests_per_second: u32) -> Duration {
+        Duration::from_secs(1) / requests_per_second.max(1)
     }
 
     pub async fn discover_moneylines(&self) -> Result<Vec<UsMoneylineMarket>> {
@@ -66,16 +100,7 @@ impl PolymarketUsClient {
                 sport.discovery_path(),
                 page * limit
             );
-            let payload: EventsResponse = {
-                let _permit = self.permits.acquire().await.expect("semaphore open");
-                self.client
-                    .get(url)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?
-            };
+            let payload: EventsResponse = self.get_json(&url).await?;
             let count = payload.events.len();
             for event in payload.events {
                 let event_id = event.id.clone();
@@ -94,17 +119,12 @@ impl PolymarketUsClient {
     }
 
     pub async fn fetch_book(&self, market_slug: &str) -> Result<MarketBook> {
-        let slug = url::form_urlencoded::byte_serialize(market_slug.as_bytes()).collect::<String>();
-        let url = format!("{}/v1/markets/{slug}/book", self.base_url);
-        let _permit = self.permits.acquire().await.expect("semaphore open");
-        let payload: BookResponse = self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let url = format!(
+            "{}/v1/markets/{}/book",
+            self.base_url,
+            encode_slug(market_slug)
+        );
+        let payload: BookResponse = self.get_json(&url).await?;
         normalize_book(payload.market_data)
     }
 
@@ -120,6 +140,118 @@ impl PolymarketUsClient {
             .collect()
             .await
     }
+
+    /// YES payout per contract (0..=1) once the market has settled; `None`
+    /// while the venue has not published a settlement (404).
+    pub async fn fetch_settlement(&self, market_slug: &str) -> Result<Option<Decimal>> {
+        let url = format!(
+            "{}/v1/markets/{}/settlement",
+            self.base_url,
+            encode_slug(market_slug)
+        );
+        let Some(payload) = self.get_json_opt::<SettlementResponse>(&url).await? else {
+            return Ok(None);
+        };
+        decimal_from_value(&payload.settlement, "settlement").map(Some)
+    }
+
+    /// Closing line: the last price-history point at or before `start_time`,
+    /// or the earliest point when the series starts after it (the live series
+    /// begins 15 minutes before start). `None` when no history exists.
+    pub async fn fetch_closing_price(
+        &self,
+        market_slug: &str,
+        start_time: DateTime<Utc>,
+    ) -> Result<Option<ClosingPrice>> {
+        let url = format!(
+            "{}/v1/price-history?symbol={}&fixedInterval=INTERVAL_LIVE&fidelity=1",
+            self.base_url,
+            encode_slug(market_slug)
+        );
+        let Some(payload) = self.get_json_opt::<PriceHistoryResponse>(&url).await? else {
+            return Ok(None);
+        };
+        select_closing_point(&payload.history, start_time)
+            .map(|point| {
+                Ok(ClosingPrice {
+                    long_price: decimal_from_f64(point.long_price, "longPrice")?,
+                    short_price: decimal_from_f64(point.short_price, "shortPrice")?,
+                    observed_at: DateTime::from_timestamp(point.timestamp, 0).ok_or_else(|| {
+                        Error::InvalidData(format!(
+                            "price history timestamp out of range: {}",
+                            point.timestamp
+                        ))
+                    })?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+        self.get_json_opt(url)
+            .await?
+            .ok_or_else(|| Error::InvalidData(format!("gateway returned 404 for {url}")))
+    }
+
+    /// Every gateway GET: bounded by the permit count, paced by the shared
+    /// rate limiter, retried once after a 429. A 404 is `Ok(None)`.
+    async fn get_json_opt<T: DeserializeOwned>(&self, url: &str) -> Result<Option<T>> {
+        let _permit = self.permits.acquire().await.expect("semaphore open");
+        let mut retried = false;
+        loop {
+            self.pace().await;
+            let response = self.client.get(url).send().await?;
+            match response.status() {
+                StatusCode::NOT_FOUND => return Ok(None),
+                StatusCode::TOO_MANY_REQUESTS if !retried => {
+                    retried = true;
+                    tracing::warn!(%url, "gateway rate limited the request; backing off");
+                    self.back_off(Self::RATE_LIMIT_BACKOFF).await;
+                }
+                _ => return Ok(Some(response.error_for_status()?.json().await?)),
+            }
+        }
+    }
+
+    /// Reserve the next permitted start slot and wait for it.
+    async fn pace(&self) {
+        let start = {
+            let mut next = self.pacer.lock().await;
+            let start = (*next).max(Instant::now());
+            *next = start + self.min_interval;
+            start
+        };
+        tokio::time::sleep_until(start).await;
+    }
+
+    /// Push every pending request start out by at least `delay`.
+    async fn back_off(&self, delay: Duration) {
+        let mut next = self.pacer.lock().await;
+        *next = (*next).max(Instant::now() + delay);
+    }
+}
+
+fn encode_slug(market_slug: &str) -> String {
+    url::form_urlencoded::byte_serialize(market_slug.as_bytes()).collect()
+}
+
+/// Last point at or before `start_time`; otherwise the earliest point.
+fn select_closing_point(
+    points: &[RawPricePoint],
+    start_time: DateTime<Utc>,
+) -> Option<&RawPricePoint> {
+    let cutoff = start_time.timestamp();
+    points
+        .iter()
+        .filter(|point| point.timestamp <= cutoff)
+        .max_by_key(|point| point.timestamp)
+        .or_else(|| points.iter().min_by_key(|point| point.timestamp))
+}
+
+fn decimal_from_f64(value: f64, field: &str) -> Result<Decimal> {
+    Decimal::try_from(value)
+        .map(|value| value.round_dp(4))
+        .map_err(|error| Error::InvalidData(format!("{field}: {error}")))
 }
 
 fn normalize_book(data: RawMarketData) -> Result<MarketBook> {
@@ -380,6 +512,25 @@ struct BookResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct SettlementResponse {
+    settlement: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceHistoryResponse {
+    #[serde(default)]
+    history: Vec<RawPricePoint>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPricePoint {
+    timestamp: i64,
+    long_price: f64,
+    short_price: f64,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawMarketData {
     market_slug: String,
@@ -428,6 +579,139 @@ mod tests {
             Sport::Nfl,
             "The winner resolves to one."
         ));
+    }
+
+    #[test]
+    fn tennis_accepts_last_fair_market_price_wording() {
+        assert!(settlement_rules_supported(
+            Sport::Tennis,
+            "A walkover before the first serve settles at the last fair market price."
+        ));
+    }
+
+    fn point(timestamp: i64, long_price: f64) -> RawPricePoint {
+        RawPricePoint {
+            timestamp,
+            long_price,
+            short_price: 1.0 - long_price,
+        }
+    }
+
+    #[test]
+    fn closing_point_is_last_at_or_before_start() {
+        let start = DateTime::from_timestamp(1_000, 0).unwrap();
+        let points = [point(100, 0.40), point(1_000, 0.45), point(1_060, 0.60)];
+        let chosen = select_closing_point(&points, start).unwrap();
+        assert_eq!(chosen.timestamp, 1_000);
+    }
+
+    #[test]
+    fn closing_point_falls_back_to_earliest_when_series_starts_late() {
+        let start = DateTime::from_timestamp(1_000, 0).unwrap();
+        let points = [point(1_120, 0.55), point(1_060, 0.50), point(1_180, 0.70)];
+        let chosen = select_closing_point(&points, start).unwrap();
+        assert_eq!(chosen.timestamp, 1_060);
+    }
+
+    #[test]
+    fn closing_point_is_none_for_empty_history() {
+        let start = DateTime::from_timestamp(1_000, 0).unwrap();
+        assert!(select_closing_point(&[], start).is_none());
+    }
+
+    #[test]
+    fn price_history_converts_floats_to_four_places() {
+        let payload: PriceHistoryResponse = serde_json::from_str(
+            r#"{"history":[{"timestamp":1,"longPrice":0.43210012,"shortPrice":0.56789988}]}"#,
+        )
+        .unwrap();
+        let point = &payload.history[0];
+        assert_eq!(
+            decimal_from_f64(point.long_price, "longPrice").unwrap(),
+            Decimal::new(4321, 4)
+        );
+        assert_eq!(
+            decimal_from_f64(point.short_price, "shortPrice").unwrap(),
+            Decimal::new(5679, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn pacer_spaces_request_starts() {
+        let client = PolymarketUsClient::new("http://localhost", Duration::from_secs(1))
+            .unwrap()
+            .with_rate_limit(50);
+        let started = Instant::now();
+        for _ in 0..4 {
+            client.pace().await;
+        }
+        // First start is immediate; three more slots of 20 ms follow.
+        assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[tokio::test]
+    async fn settlement_maps_404_to_none_and_parses_payout() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/v1/markets/settled/settlement");
+                then.status(200)
+                    .json_body(serde_json::json!({ "slug": "settled", "settlement": "1" }));
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/v1/markets/open/settlement");
+                then.status(404);
+            })
+            .await;
+        let client = PolymarketUsClient::new(server.base_url(), Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            client.fetch_settlement("settled").await.unwrap(),
+            Some(Decimal::ONE)
+        );
+        assert_eq!(client.fetch_settlement("open").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn closing_price_uses_last_pre_start_point() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/v1/price-history")
+                    .query_param("symbol", "game")
+                    .query_param("fixedInterval", "INTERVAL_LIVE")
+                    .query_param("fidelity", "1");
+                then.status(200).json_body(serde_json::json!({
+                    "history": [
+                        { "timestamp": 900, "longPrice": 0.40, "shortPrice": 0.60 },
+                        { "timestamp": 960, "longPrice": 0.42, "shortPrice": 0.58 },
+                        { "timestamp": 1020, "longPrice": 0.70, "shortPrice": 0.30 }
+                    ]
+                }));
+            })
+            .await;
+        let client = PolymarketUsClient::new(server.base_url(), Duration::from_secs(5)).unwrap();
+
+        let closing = client
+            .fetch_closing_price("game", DateTime::from_timestamp(1_000, 0).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            closing,
+            ClosingPrice {
+                long_price: Decimal::new(42, 2),
+                short_price: Decimal::new(58, 2),
+                observed_at: DateTime::from_timestamp(960, 0).unwrap(),
+            }
+        );
     }
 
     #[test]

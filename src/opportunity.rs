@@ -120,15 +120,58 @@ impl OpportunityEngine {
             reasons.push("paper portfolio already has this market side".into());
         }
 
-        let conservative = (fair - dispersion).max(Decimal::ZERO);
-        let exact_fee_per_contract = exact_fee(market.fee_coefficient, Decimal::ONE, top_yes_price);
+        let lead = market.start_time - Utc::now();
+        let minimum_lead_seconds = self.settings.minimum_lead.as_secs() as i64;
+        if lead.num_seconds() < minimum_lead_seconds {
+            reasons.push(format!(
+                "starts in {}m, below the {}m minimum lead",
+                lead.num_minutes(),
+                minimum_lead_seconds / 60
+            ));
+        }
 
-        let kelly = quarter_kelly_fraction(
+        let conservative = (fair - dispersion - self.settings.consensus_bias).max(Decimal::ZERO);
+        let exact_fee_per_contract = exact_fee(market.fee_coefficient, Decimal::ONE, top_yes_price);
+        let kelly_fraction = self.settings.kelly_fraction;
+        let maximum_position_fraction = self.settings.maximum_position_fraction;
+
+        let mut kelly = quarter_kelly_fraction(
             conservative,
             top_price + exact_fee_per_contract,
-            self.settings.kelly_fraction,
+            kelly_fraction,
         )
-        .min(self.settings.maximum_position_fraction);
+        .min(maximum_position_fraction);
+        let event_exposure = portfolio.exposure_for_event(&market.event_id);
+        let portfolio_remaining =
+            (self.settings.maximum_total_exposure - portfolio.open_exposure).max(Decimal::ZERO);
+        let event_remaining =
+            (self.settings.maximum_event_exposure - event_exposure).max(Decimal::ZERO);
+        let exposure_remaining = portfolio_remaining.min(event_remaining);
+        let size = |kelly: Decimal| {
+            size_position_from_levels(
+                (self.settings.bankroll * kelly).min(exposure_remaining),
+                market.fee_coefficient,
+                market.minimum_quantity,
+                self.settings.maximum_price,
+                &levels,
+            )
+        };
+        let mut sized = size(kelly);
+        // The top-of-book Kelly overstates the edge once the fill climbs the
+        // book; re-size once at the depth-weighted cost. VWAP only rises with
+        // quantity, so the second pass never exceeds the first.
+        if sized.quantity > Decimal::ZERO {
+            let kelly_vwap = quarter_kelly_fraction(
+                conservative,
+                sized.average_side_price + sized.estimated_fee / sized.quantity,
+                kelly_fraction,
+            )
+            .min(maximum_position_fraction);
+            if kelly_vwap < kelly {
+                kelly = kelly_vwap;
+                sized = size(kelly);
+            }
+        }
         if kelly < self.settings.minimum_position_fraction {
             reasons.push(format!(
                 "quarter-Kelly size {} is below {}",
@@ -136,20 +179,6 @@ impl OpportunityEngine {
                 self.settings.minimum_position_fraction
             ));
         }
-        let event_exposure = portfolio.exposure_for_event(&market.event_id);
-        let portfolio_remaining =
-            (self.settings.maximum_total_exposure - portfolio.open_exposure).max(Decimal::ZERO);
-        let event_remaining =
-            (self.settings.maximum_total_exposure - event_exposure).max(Decimal::ZERO);
-        let exposure_remaining = portfolio_remaining.min(event_remaining);
-        let risk_budget = (self.settings.bankroll * kelly).min(exposure_remaining);
-        let sized = size_position_from_levels(
-            risk_budget,
-            market.fee_coefficient,
-            market.minimum_quantity,
-            self.settings.maximum_price,
-            &levels,
-        );
         if sized.quantity < market.minimum_quantity {
             reasons.push("insufficient eligible book depth".into());
         }
@@ -178,6 +207,8 @@ impl OpportunityEngine {
             exact_fee_per_contract
         };
         // Six places is far below any tick or fee; keeps records legible.
+        // Raw edge is the unadjusted signal; net edge carries dispersion,
+        // bias and fee.
         let raw_edge = (fair - executable).round_dp(6);
         let net_edge = (conservative - executable - fee_per_contract).round_dp(6);
         if raw_edge < self.settings.minimum_raw_edge {
@@ -192,6 +223,16 @@ impl OpportunityEngine {
                 self.settings.minimum_net_edge
             ));
         }
+        // Informational: a resting order earns the rebate instead of paying
+        // the fee, but its fill is not guaranteed, so this never classifies.
+        let maker_net_edge = maker_price.map(|maker| {
+            let yes = match side {
+                OutcomeSide::Long => maker,
+                OutcomeSide::Short => Decimal::ONE - maker,
+            };
+            let rebate = self.settings.maker_rebate_coefficient * yes * (Decimal::ONE - yes);
+            (conservative - maker + rebate).round_dp(6)
+        });
 
         let hard_rejection = !reasons.is_empty();
         let reference_ok = consensus.has_reference || !self.settings.require_reference_book;
@@ -231,12 +272,12 @@ impl OpportunityEngine {
             conservative_probability: conservative.round_dp(6),
             executable_price: executable.round_dp(6),
             maker_price,
+            maker_net_edge,
             raw_edge,
             net_edge,
             quantity: sized.quantity,
             maximum_loss: sized.maximum_loss,
             estimated_fee: sized.estimated_fee,
-            source_count: consensus.source_count,
             family_count: consensus.family_count,
             source_ids: consensus.source_ids.clone(),
             start_time: market.start_time,
@@ -323,7 +364,6 @@ mod tests {
             probability_b: Decimal::new(70, 2),
             probability_neutral: Decimal::ZERO,
             dispersion_a: Decimal::ZERO,
-            source_count: 5,
             family_count: 5,
             has_reference: true,
             source_ids: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
@@ -332,11 +372,19 @@ mod tests {
     }
 
     fn portfolio() -> PaperPortfolio {
-        PaperPortfolio {
-            bankroll: Decimal::ONE_HUNDRED,
-            open_exposure: Decimal::ZERO,
-            open_positions: Vec::new(),
-        }
+        PaperPortfolio::new(Decimal::ONE_HUNDRED)
+    }
+
+    fn short(
+        settings: Settings,
+        market: &UsMoneylineMarket,
+        consensus: &ConsensusPrice,
+    ) -> Opportunity {
+        OpportunityEngine::new(settings)
+            .evaluate(market, &book(), consensus, &portfolio())
+            .into_iter()
+            .find(|item| item.side == OutcomeSide::Short)
+            .unwrap()
     }
 
     #[test]
@@ -357,16 +405,49 @@ mod tests {
     }
 
     #[test]
+    fn consensus_bias_lowers_net_edge_only() {
+        let unbiased = short(
+            Settings {
+                consensus_bias: Decimal::ZERO,
+                ..Settings::default()
+            },
+            &market(),
+            &consensus(),
+        );
+        let biased = short(Settings::default(), &market(), &consensus());
+        assert_eq!(biased.raw_edge, unbiased.raw_edge);
+        assert_eq!(unbiased.net_edge - biased.net_edge, Decimal::new(2, 2));
+        assert_eq!(
+            unbiased.conservative_probability - biased.conservative_probability,
+            Decimal::new(2, 2)
+        );
+    }
+
+    #[test]
+    fn market_inside_minimum_lead_is_rejected() {
+        let mut market = market();
+        market.start_time = Utc::now() + chrono::Duration::minutes(5);
+        let short = short(Settings::default(), &market, &consensus());
+        assert_eq!(short.class, RecommendationClass::Rejected);
+        assert!(short.reasons.iter().any(|r| r.contains("minimum lead")));
+    }
+
+    #[test]
+    fn maker_edge_earns_rebate_instead_of_fee() {
+        let mut market = market();
+        market.fee_coefficient = Decimal::new(175, 4);
+        let short = short(Settings::default(), &market, &consensus());
+        // Short at maker 0.44 sells YES at 0.56: 0.68 - 0.44 + 0.0125 * 0.56 * 0.44.
+        assert_eq!(short.maker_net_edge, Some(Decimal::new(24308, 5)));
+        assert!(short.estimated_fee > Decimal::ZERO);
+        assert!(short.maker_net_edge.unwrap() > short.net_edge);
+    }
+
+    #[test]
     fn reference_book_requirement_is_a_setting() {
         let mut consensus = consensus();
         consensus.has_reference = false;
-        let short = |settings: Settings| {
-            OpportunityEngine::new(settings)
-                .evaluate(&market(), &book(), &consensus, &portfolio())
-                .into_iter()
-                .find(|item| item.side == OutcomeSide::Short)
-                .unwrap()
-        };
+        let short = |settings: Settings| short(settings, &market(), &consensus);
         let strict = short(Settings::default());
         assert_eq!(strict.class, RecommendationClass::Watchlist);
         assert!(strict.reasons.iter().any(|r| r.contains("reference")));
@@ -384,16 +465,11 @@ mod tests {
         let mut consensus = consensus();
         consensus.probability_a = Decimal::new(53, 2);
         consensus.probability_b = Decimal::new(47, 2);
-        let short = |settings: Settings| {
-            OpportunityEngine::new(settings)
-                .evaluate(&market(), &book(), &consensus, &portfolio())
-                .into_iter()
-                .find(|item| item.side == OutcomeSide::Short)
-                .unwrap()
-        };
+        let short = |settings: Settings| short(settings, &market(), &consensus);
         let relaxed_edges = Settings {
             minimum_raw_edge: Decimal::ZERO,
             minimum_net_edge: Decimal::ZERO,
+            consensus_bias: Decimal::ZERO,
             ..Settings::default()
         };
         let floored = short(relaxed_edges.clone());

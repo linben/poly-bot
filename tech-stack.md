@@ -38,11 +38,10 @@ Markets and `c` on Portfolio reuse the `paper open`/`close` rules.
 
 | Binary | local | cloud |
 | --- | --- | --- |
-| `local` | scan loop + news loop + retention in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` for systemd | n/a |
+| `local` | scan loop + news loop + settlement loop + retention in one Tokio runtime; opens the TUI in-process when stdin/stdout are a TTY, `--headless` for systemd | n/a |
 | `scanner` | one-shot or `--continuous` against the file store | one-shot ECS task against S3/DynamoDB/SQS |
 | `tui` | attach-only viewer over `data/` | attach-only viewer over DynamoDB/S3 with the operator's AWS credentials |
-| `news-worker` | n/a (the `local` news loop drains `news-queue.ndjson`) | SQS-triggered Lambda |
-| `paper`, `source-probe` | file store | AWS store |
+| `paper`, `source-probe` | file store | AWS store (`paper settle` is how cloud-mode positions get closing lines and settlement; the ECS task does not run the settlement loop) |
 
 `news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Exa +
 deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
@@ -147,15 +146,34 @@ Base URL:
 https://gateway.polymarket.us
 ```
 
-The client uses structured league/sport discovery endpoints and the US market
-book endpoint. No wallet, CLOB signing, Polygon, or non-US order code is
-included.
+`polymarket::PolymarketUsClient` uses the structured league/sport discovery
+endpoints, `GET /v1/markets/{slug}/book` for depth, and two public endpoints
+that grade paper positions after the fact: `GET /v1/markets/{slug}/settlement`
+(404 until the market resolves) and `GET /v1/price-history?symbol={slug}&
+fixedInterval=INTERVAL_LIVE&fidelity=1`, whose series starts 15 minutes before
+the event; the last point at or before scheduled start is the closing line.
+Every request takes a concurrency permit (`POLYMARKET_CONCURRENCY`) and then a
+slot from a shared pacer (`POLYMARKET_REQUESTS_PER_SECOND`, default 18 against
+the documented 20 req/s/IP public limit); a 429 pushes the pacer out one
+second and retries once. No wallet, CLOB signing, Polygon, or non-US order code
+is included.
+
+Fee schedule (effective 2026-07-01): taker `0.06 * C * p * (1 - p)` per fill,
+banker's-rounded to cents, order total capped at the rounding of the cumulative
+exact fee; makers pay nothing and receive `0.0125 * C * p * (1 - p)`. The
+market's `feeCoefficient` is read per market; the maker rebate coefficient is
+`MAKER_REBATE_COEFFICIENT`.
 
 The US book has one YES instrument:
 
 - Long execution consumes YES offers.
 - Opposing-outcome execution consumes YES bids at a side cost of
   `1 - YES bid`.
+
+Settlement rules that matter for a moneyline bot: NFL ties pay $0.50;
+pre-start withdrawal, postponement past expiry, cancellation and no-contest
+settle at *last fair market price* (ITF tennis at $0.50), where sportsbooks
+void. Those phrases are hard `review` terms for the keyword reviewer.
 
 ### Odds Adapters
 
@@ -249,20 +267,43 @@ two hours cannot preserve an actionable classification.
 ### Consensus
 
 - Reject quotes not observed within the freshness window (`fetched_at`),
-  future-dated quotes, and validation-only quotes.
+  future-dated quotes, and validation-only quotes. On the confirmation pass
+  only refetched sources are held to `CONFIRMATION_MAX_AGE_SECONDS`; the rest
+  keep the preliminary `MAX_QUOTE_AGE_SECONDS`.
+- Kalshi and Polymarket global quotes are excluded for games starting more
+  than `EXCHANGE_MAX_LEAD_HOURS` out.
 - Keep the most recently observed quote per source family.
 - Remove vig proportionally, including neutral settlement outcomes.
 - Use median fair probability and median absolute deviation.
 - Remove outliers beyond the configured robust limit.
+- A market with matched quotes but no consensus (invalid odds, all outliers)
+  is logged at `warn`; unmatched markets at `debug`.
 
 ### Risk and Execution
 
 - Use Decimal for every monetary and probability calculation.
+- `conservative = fair - MAD - CONSENSUS_BIAS`; raw edge uses `fair`, net edge
+  and sizing use `conservative`.
+- Reject rows inside `MINIMUM_LEAD_MINUTES` of start.
 - Walk multiple order-book levels to a maximum side price.
-- Apply fee coefficients and banker's rounding.
-- Recompute edge from execution VWAP.
-- Size with quarter Kelly.
-- Enforce minimum quantity, 1-5% position risk, and $5 total exposure.
+- Apply the venue's fee arithmetic per fill and cap the order total.
+- Recompute edge from execution VWAP; size with `KELLY_FRACTION` Kelly at top
+  of book, then once more at the VWAP cost and keep the smaller.
+- Report `maker_net_edge` (rebate instead of fee, one tick inside the spread)
+  without letting it classify.
+- Enforce minimum quantity, 1-5% position risk, `MAXIMUM_EVENT_EXPOSURE` per
+  event, and $5 total exposure.
+
+### Paper Ledger
+
+`paper::settle_positions` runs from the `local` engine loop every
+`SETTLEMENT_POLL_SECONDS` and from `paper settle`. For each open position past
+its start time it records the closing side price once, then, when the venue
+publishes a settlement, books `quantity * (payout - entry) - fee`, archives the
+position under `closed_positions`, and sets `bankroll = PAPER_BANKROLL +
+realized`. `Store::load_portfolio` recomputes realized P&L and bankroll from
+the closed positions on every load, so the JSON file (or DynamoDB item) is
+never the source of truth for derived totals.
 
 ## Infrastructure as Code
 

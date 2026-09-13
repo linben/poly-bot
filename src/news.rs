@@ -161,6 +161,9 @@ impl NewsReviewer for KeywordReviewer {
     }
 }
 
+/// Terms that force manual review. Pre-start postponement, withdrawal, or
+/// cancellation settles Polymarket US game contracts at last fair market
+/// price while sportsbooks void, so the venue exposure differs in kind.
 const HARD_RISK_TERMS: &[&str] = &[
     "ruled out",
     "scratched",
@@ -169,8 +172,12 @@ const HARD_RISK_TERMS: &[&str] = &[
     "withdraw",
     "walkover",
     "postponed",
+    "postponement",
+    "rained out",
+    "rainout",
     "cancelled",
     "canceled",
+    "no contest",
     "will not play",
     "out for the season",
     "placed on the il",
@@ -526,12 +533,12 @@ mod tests {
             conservative_probability: Decimal::ZERO,
             executable_price: Decimal::ZERO,
             maker_price: None,
+            maker_net_edge: None,
             raw_edge: Decimal::ZERO,
             net_edge: Decimal::ZERO,
             quantity: Decimal::ZERO,
             maximum_loss: Decimal::ZERO,
             estimated_fee: Decimal::ZERO,
-            source_count: 0,
             family_count: 0,
             source_ids: Vec::new(),
             start_time: Utc::now() + chrono::Duration::hours(2),

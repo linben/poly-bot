@@ -138,10 +138,13 @@ before any proposal for authenticated live trading.
 
 ## Future Direction
 
-After reliable source collection and sufficient paper history:
+Settlement ingestion, paper P&L, and closing-line value are recorded per
+position. After sufficient paper history:
 
-1. Add settlement ingestion and paper P&L attribution.
-2. Measure calibration, closing-line value, drawdown, and source contribution.
+1. Fit `CONSENSUS_BIAS` and the exchange lead window from realized
+   calibration instead of literature priors.
+2. Measure drawdown, source contribution, and maker-vs-taker fill assumptions
+   against the recorded closing lines.
 3. Add replayable historical backtests using only point-in-time data.
 4. Tune sport-specific matching and settlement policies.
 5. Evaluate whether a separate, explicitly approved live-execution service is

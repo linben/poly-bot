@@ -11,6 +11,7 @@ use polybot::{
     Result,
     config::{RunMode, Settings},
     news::{SharedReviewer, process_news_queue, reviewer_from_env},
+    paper::settle_positions,
     scanner::Scanner,
     storage::{Store, store_for},
     tui::{
@@ -86,6 +87,7 @@ async fn main() -> Result<()> {
                 process_news_queue(store.as_ref(), reviewer.as_ref(), news_refresh).await?;
             info!(reviewed, "news pass complete");
         }
+        run_settlement(store.as_ref(), &settings, &scanner).await;
         return Ok(());
     }
 
@@ -145,11 +147,14 @@ struct Engine {
 }
 
 /// Scan on a fixed cadence (a slow scan delays the next tick), drain the news
-/// queue between scans, prune old snapshots, and publish status for the UI.
+/// queue between scans, settle started paper positions, prune old snapshots,
+/// and publish status for the UI.
 async fn engine_loop(mut engine: Engine) {
     let retention = Duration::from_secs(u64::from(engine.settings.retention_days) * 86_400);
     let mut news_ticker = interval(Duration::from_secs(20));
     news_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut settlement_ticker = interval(engine.settings.settlement_poll);
+    settlement_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut next_scan = Instant::now();
     loop {
         if *engine.shutdown_rx.borrow() {
@@ -192,6 +197,9 @@ async fn engine_loop(mut engine: Engine) {
                     warn!(%error, "draining unused news queue failed");
                 }
             }
+            _ = settlement_ticker.tick() => {
+                run_settlement(store.as_ref(), settings, scanner).await;
+            }
             command = port.commands.recv() => match command {
                 Some(EngineCommand::ScanNow) => next_scan = Instant::now(),
                 Some(EngineCommand::Shutdown) | None => {
@@ -205,6 +213,20 @@ async fn engine_loop(mut engine: Engine) {
                 }
             }
         }
+    }
+}
+
+/// One settlement pass over the paper book; failures are logged, never fatal.
+async fn run_settlement(store: &dyn Store, settings: &Settings, scanner: &Scanner) {
+    match settle_positions(store, settings, scanner.polymarket()).await {
+        Ok(report) if report.closing_lines_recorded > 0 || report.settled > 0 => info!(
+            settled = report.settled,
+            closing_lines = report.closing_lines_recorded,
+            realized_pnl = %report.realized_pnl,
+            "paper settlement pass complete"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "paper settlement pass failed"),
     }
 }
 

@@ -648,13 +648,12 @@ pub mod aws {
 }
 
 fn empty_portfolio(bankroll: Decimal) -> PaperPortfolio {
-    PaperPortfolio {
-        bankroll,
-        open_exposure: Decimal::ZERO,
-        open_positions: Vec::new(),
-    }
+    PaperPortfolio::new(bankroll)
 }
 
+/// `bankroll` is the configured sizing base; the stored bankroll and
+/// realized P&L are derived from the positions on every load so a hand-edited
+/// or older file cannot drift from them.
 fn normalize_portfolio(mut portfolio: PaperPortfolio, bankroll: Decimal) -> Result<PaperPortfolio> {
     if bankroll <= Decimal::ZERO {
         return Err(Error::Config("PAPER_BANKROLL must be positive".into()));
@@ -668,7 +667,12 @@ fn normalize_portfolio(mut portfolio: PaperPortfolio, bankroll: Decimal) -> Resu
             "paper portfolio contains a non-positive position".into(),
         ));
     }
-    portfolio.bankroll = bankroll;
+    portfolio.realized_pnl = portfolio
+        .closed_positions
+        .iter()
+        .map(|position| position.realized_pnl.unwrap_or(Decimal::ZERO))
+        .sum();
+    portfolio.bankroll = bankroll + portfolio.realized_pnl;
     portfolio.open_exposure = portfolio
         .open_positions
         .iter()
@@ -685,7 +689,36 @@ fn normalize_portfolio(mut portfolio: PaperPortfolio, bankroll: Decimal) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{OutcomeSide, PaperPosition};
+    use crate::domain::{OutcomeSide, PaperPosition, RecommendationClass, Sport};
+
+    fn opportunity(maximum_loss: Decimal) -> Opportunity {
+        Opportunity {
+            id: Uuid::new_v4(),
+            generated_at: Utc::now(),
+            class: RecommendationClass::Actionable,
+            sport: Sport::Nba,
+            event_id: "event".into(),
+            market_id: "market".into(),
+            market_slug: "market-slug".into(),
+            participant: "Team".into(),
+            side: OutcomeSide::Long,
+            fair_probability: Decimal::new(55, 2),
+            conservative_probability: Decimal::new(52, 2),
+            executable_price: Decimal::new(50, 2),
+            maker_price: None,
+            maker_net_edge: None,
+            raw_edge: Decimal::new(5, 2),
+            net_edge: Decimal::new(2, 2),
+            quantity: Decimal::new(4, 0),
+            maximum_loss,
+            estimated_fee: Decimal::new(1, 2),
+            family_count: 3,
+            source_ids: vec!["a".into(), "b".into(), "c".into()],
+            start_time: Utc::now() + chrono::Duration::hours(2),
+            book_time: Utc::now(),
+            reasons: Vec::new(),
+        }
+    }
 
     #[tokio::test]
     async fn local_store_persists_portfolio_and_enforces_lease() {
@@ -714,22 +747,34 @@ mod tests {
         );
         store.release_scan_lease(second).await.unwrap();
 
-        let portfolio = PaperPortfolio {
-            bankroll: Decimal::ONE_HUNDRED,
-            open_exposure: Decimal::new(99, 0),
-            open_positions: vec![PaperPosition {
-                opportunity_id: Uuid::new_v4(),
-                event_id: "event".into(),
-                market_id: "market".into(),
-                side: OutcomeSide::Long,
-                maximum_loss: Decimal::new(2, 0),
-                opened_at: Utc::now(),
-            }],
-        };
+        let mut portfolio = PaperPortfolio::new(Decimal::ONE_HUNDRED);
+        portfolio.open_exposure = Decimal::new(99, 0);
+        portfolio
+            .open_positions
+            .push(PaperPosition::from_opportunity(
+                &opportunity(Decimal::new(2, 0)),
+                Utc::now(),
+            ));
+        let mut settled =
+            PaperPosition::from_opportunity(&opportunity(Decimal::new(3, 0)), Utc::now());
+        settled.realized_pnl = Some(Decimal::new(-3, 0));
+        settled.closed_at = Some(Utc::now());
+        portfolio.closed_positions.push(settled);
+        portfolio
+            .closed_positions
+            .push(PaperPosition::from_opportunity(
+                &opportunity(Decimal::new(1, 0)),
+                Utc::now(),
+            ));
         store.save_portfolio(&portfolio).await.unwrap();
         let loaded = store.load_portfolio(Decimal::ONE_HUNDRED).await.unwrap();
         assert_eq!(loaded.open_exposure, Decimal::new(2, 0));
         assert_eq!(loaded.open_positions.len(), 1);
+        assert_eq!(loaded.closed_positions.len(), 2);
+        // Realized P&L is recomputed from the settled records (a manual close
+        // without a result counts as zero) and the bankroll carries it.
+        assert_eq!(loaded.realized_pnl, Decimal::new(-3, 0));
+        assert_eq!(loaded.bankroll, Decimal::new(97, 0));
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -123,7 +123,6 @@ pub fn build_consensus(
         probability_b,
         probability_neutral,
         dispersion_a,
-        source_count: source_ids.len(),
         family_count: fair.len(),
         has_reference,
         source_ids,
