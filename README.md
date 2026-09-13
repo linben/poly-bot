@@ -6,7 +6,7 @@ the executable US order book with a de-vigged consensus built from free public
 odds sources (Pinnacle, Action Network's book lines, ESPN/DraftKings, Kalshi,
 Polymarket global, Smarkets) and an optional quota-limited confirmation feed,
 and enriches candidates with recent
-Brave Search evidence summarized by AWS Bedrock.
+Exa search evidence summarized by AWS Bedrock.
 
 This repository does not contain wallet credentials, exchange authentication,
 or order-submission code. It cannot place a live trade.
@@ -55,14 +55,14 @@ the same scanner, consensus, sizing, and news logic.
 | --- | --- | --- |
 | Process | one `local` binary: scan loop, news loop, retention, terminal UI | ECS one-shot `scanner`, Lambda `news-worker` |
 | Store | files under `data/` (`scans/`, `latest-opportunities.json`, `news/`, `portfolio.json`, `scanner.lock`) | S3 + DynamoDB + SQS |
-| News reviewer | `keyword` (Brave + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
+| News reviewer | `keyword` (Exa + risk-term classifier), `bedrock`, `off`, or none | Bedrock via SQS |
 | Dashboard | terminal UI in-process, or `tui` attached to `data/` | `tui` with `RUN_MODE=cloud` and AWS credentials |
 | Requires | Rust toolchain, outbound HTTPS | AWS account, Terraform, Docker, cargo-lambda |
 
 ### Local mode
 
 ```bash
-cp .env.example .env            # optional: add THE_ODDS_API_KEY / BRAVE_SEARCH_API_KEY
+cp .env.example .env            # optional: add THE_ODDS_API_KEY / EXA_API_KEY
 set -a; source .env; set +a
 make local                      # or: cargo run --release --bin local
 make local-explore              # loosest gates, separate data-explore/ dir
@@ -143,7 +143,7 @@ perform concurrent network collection without Lambda's packaging and duration
 constraints. A DynamoDB lease prevents overlapping scheduled tasks.
 
 Lambda is used only for the short, event-driven news work: SQS-triggered
-Brave Search and Bedrock enrichment.
+Exa search and Bedrock enrichment.
 
 S3 stores raw scans and quote snapshots. DynamoDB stores current
 recommendations, news evidence, paper portfolio state, and the scanner lease.
@@ -155,14 +155,14 @@ Operators inspect the cloud store with `RUN_MODE=cloud cargo run --features aws
 `NEWS_REVIEWER` picks how candidates are vetted. Every reviewer can only
 preserve or downgrade a candidate.
 
-- `keyword` (default when `BRAVE_SEARCH_API_KEY` is set): Brave Search, then a
+- `keyword` (default when `EXA_API_KEY` is set): Exa search, then a
   deterministic classifier. A citation counts only if it names the participant;
   hard terms (ruled out, scratched, suspended, withdrawn, postponed, ...) force
   `review` with manual review, soft terms (questionable, doubtful, injury,
   weather delay) give `lower`, otherwise `unchanged`. No citations at all is
   `review`.
-- `bedrock`: Brave Search summarized by Bedrock (build with `--features aws`).
-- none (default without a Brave key): no evidence is written, so nothing can
+- `bedrock`: Exa search summarized by Bedrock (build with `--features aws`).
+- none (default without an Exa key): no evidence is written, so nothing can
   leave the watchlist.
 - `off`: records `unchanged` without searching. This removes the news veto and
   is only for operators who review every candidate by hand.
@@ -302,7 +302,7 @@ homepage reachability checks. Logs go to stderr, JSON results to stdout.
 2. Build and push the scanner image using the immutable configured tag.
 3. Build the `news-worker` Lambda archive.
 4. Apply the complete Terraform stack.
-5. Put the Brave free-plan key in the generated secret.
+5. Put the Exa API key in the generated secret.
 
 ```bash
 cp infra/terraform.tfvars.example infra/terraform.tfvars
@@ -320,7 +320,7 @@ terraform -chdir=infra apply
 
 aws secretsmanager put-secret-value \
   --secret-id "$(terraform -chdir=infra output -raw application_secret_id)" \
-  --secret-string '{"brave_search_api_key":"replace-me","the_odds_api_key":"optional"}'
+  --secret-string '{"exa_api_key":"replace-me","the_odds_api_key":"optional"}'
 ```
 
 The Lambda zip path defaults to cargo-lambda's output under `target/lambda/`.

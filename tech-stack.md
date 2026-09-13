@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Language | Rust 2024 edition, Rust 1.90+ | Scanner, terminal UI, source adapters, news worker, paper CLI |
 | Async runtime | Tokio | Concurrent HTTP collection and service execution |
-| HTTP client | Reqwest with rustls | Polymarket, source adapters, and Brave Search |
+| HTTP client | Reqwest with rustls | Polymarket, source adapters, and Exa search |
 | Terminal UI | ratatui + crossterm | Operator views over the local or cloud store |
 | Serialization | Serde and serde_json | Upstream normalization and persisted records |
 | Numeric model | rust_decimal | Odds, probabilities, fees, VWAP, and risk without floats |
@@ -43,7 +43,7 @@ open`/`close` rules.
 | `news-worker` | n/a (the `local` news loop drains `news-queue.ndjson`) | SQS-triggered Lambda |
 | `paper`, `source-probe` | file store | AWS store |
 
-`news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Brave +
+`news::NewsReviewer` abstracts the review step: `KeywordReviewer` (Exa +
 deterministic risk terms), `BedrockNewsEnricher` (`aws` feature), or
 `DisabledReviewer`. `Store::take_news_queue` and `Store::prune` are the two
 local-only operations; the AWS store's defaults are no-ops because SQS and S3
@@ -82,7 +82,7 @@ The task:
 ### Lambda
 
 One Rust Lambda function, `news-worker`, handles the event-driven work: it
-consumes SQS messages, calls Brave Search and Bedrock, and stores cited news
+consumes SQS messages, calls Exa search and Bedrock, and stores cited news
 evidence.
 
 The news worker returns partial batch failures so one bad record does not
@@ -113,7 +113,7 @@ The state table uses `pk` and `sk` string keys. Main records include:
 | --- | --- | --- |
 | `LATEST` | `OPPORTUNITIES` | Latest recommendation collection |
 | `OPPORTUNITY#<uuid>` | timestamp | Historical opportunity |
-| `OPPORTUNITY#<uuid>` | `NEWS` | Brave/Bedrock evidence |
+| `OPPORTUNITY#<uuid>` | `NEWS` | Exa/Bedrock evidence |
 | `PORTFOLIO` | `PAPER` | Paper bankroll and open positions |
 | `LOCK#SCANNER` | `LEASE` | Scanner owner and expiry |
 
@@ -128,7 +128,7 @@ IDs and a one-hour evidence cache prevent duplicate five-minute search calls.
 
 ### Secrets Manager
 
-The application secret stores the Brave Search key. The news Lambda reads it
+The application secret stores the Exa API key. The news Lambda reads it
 at runtime. The Odds API key, when used, is supplied to the scanner task as
 `THE_ODDS_API_KEY`.
 
@@ -183,9 +183,9 @@ The scanner requires `MINIMUM_CONFIGURED_SOURCES` (default 3) distinct
 continuous families at startup and fails otherwise. A reference book and the
 five-family quorum are enforced per opportunity at runtime.
 
-### Brave Search and Bedrock
+### Exa Search and Bedrock
 
-Brave Search retrieves recent injury, lineup, suspension, withdrawal, weather,
+Exa search retrieves recent injury, lineup, suspension, withdrawal, weather,
 and schedule evidence. Bedrock runs an Anthropic-compatible request that must
 return strict JSON:
 

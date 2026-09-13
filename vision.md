@@ -58,7 +58,7 @@ reference book.
 
 ### News Can Veto, Not Invent
 
-Brave Search and Bedrock may preserve or downgrade a sportsbook-derived
+Exa search and Bedrock may preserve or downgrade a sportsbook-derived
 candidate. An LLM cannot create a probability, increase position size, or turn
 a negative numeric edge into an actionable result.
 
@@ -85,7 +85,7 @@ and news citations are retained so a recommendation can be reconstructed.
 - Proportional de-vigging and robust median/MAD consensus
 - Provider-ID-first event matching
 - Multi-level YES and opposing-outcome execution pricing
-- Brave Search and Bedrock news review
+- Exa search and Bedrock news review
 - Explicit paper position open and close workflow
 - Terminal UI over the local or cloud store
 

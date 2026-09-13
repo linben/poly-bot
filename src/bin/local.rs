@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     match &reviewer {
         Some(reviewer) => info!(reviewer = reviewer.name(), "news reviewer active"),
         None => warn!(
-            "no news reviewer configured; candidates stay on the watchlist (set BRAVE_SEARCH_API_KEY or NEWS_REVIEWER)"
+            "no news reviewer configured; candidates stay on the watchlist (set EXA_API_KEY or NEWS_REVIEWER)"
         ),
     }
     let news_refresh = Duration::from_secs(
